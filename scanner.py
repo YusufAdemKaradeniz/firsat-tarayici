@@ -143,8 +143,8 @@ def bias_by_bar(df15: pd.DataFrame, s: dict) -> np.ndarray:
             st = -1
         out[i] = st
     # Sadece KAPANMIŞ 4s mumlar: 4s mumun bitiş zamanı <= 15dk mumun başlangıcı
-    ends = pd.DataFrame({"t": h4.index + pd.Timedelta(s["bias_tf"]), "bias": out})
-    left = pd.DataFrame({"t": df15.index})
+    ends = pd.DataFrame({"t": (h4.index + pd.Timedelta(s["bias_tf"])).as_unit("ns"), "bias": out})
+    left = pd.DataFrame({"t": df15.index.as_unit("ns")})
     m = pd.merge_asof(left, ends, on="t", direction="backward")
     return m["bias"].fillna(0).astype(int).values
 
@@ -411,6 +411,7 @@ def _clean(df: pd.DataFrame) -> pd.DataFrame:
     df = df.astype(float).dropna()
     df.index = pd.to_datetime(df.index)
     df.index = df.index.tz_localize("UTC") if df.index.tz is None else df.index.tz_convert("UTC")
+    df.index = df.index.as_unit("ns")
     df = df[~df.index.duplicated(keep="last")].sort_index()
     df = df[(df["high"] >= df["low"]) & (df["close"] > 0)]
     now = pd.Timestamp.now(tz="UTC")
