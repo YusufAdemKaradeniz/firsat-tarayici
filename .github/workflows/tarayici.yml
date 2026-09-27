@@ -1,0 +1,55 @@
+name: Firsat Tarayici
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"      # her 5 dakikada bir (GitHub bazen birkaç dakika geciktirebilir)
+  workflow_dispatch:           # Actions sekmesinden elle çalıştırma
+    inputs:
+      mode:
+        description: "Mod: test = deneme mesajı, scan = normal tarama, brief = günlük özet, rapor = geçmiş test"
+        required: true
+        default: "test"
+        type: choice
+        options: [test, scan, brief, rapor]
+
+permissions:
+  contents: write              # state.json dosyasını kaydedebilmek için
+
+concurrency:
+  group: firsat-tarayici
+  cancel-in-progress: false
+
+jobs:
+  tara:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Kodu al
+        uses: actions/checkout@v4
+
+      - name: Python kur
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Kütüphaneleri kur
+        run: pip install -r requirements.txt
+
+      - name: Piyasayı tara
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          MODE: ${{ github.event.inputs.mode || 'scan' }}
+        run: python scanner.py
+
+      - name: Durumu kaydet
+        run: |
+          if [ -n "$(git status --porcelain state.json)" ]; then
+            git config user.name "firsat-bot"
+            git config user.email "firsat-bot@users.noreply.github.com"
+            git add state.json
+            git commit -m "durum güncellendi"
+            git pull --rebase || true
+            git push
+          fi
