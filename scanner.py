@@ -1,7 +1,6 @@
-
 #!/usr/bin/env python3
 """
-S&D + ICT Fırsat Tarayıcı  (sürüm 3)
+S&D + ICT Fırsat Tarayıcı  (sürüm 4)
 ====================================
 Strateji:
   1) Yön      : 4 saatlik trend (son kırılan salınım)
@@ -9,6 +8,7 @@ Strateji:
   3) Zaman    : Londra ve New York seansları (killzone)
   4) Teyit    : 15 dakikalıkta yapı kırılımı (MSS). Likidite süpürmesi kaliteyi artırır.
   5) Giriş    : FVG'ye / MSS mumuna geri çekilmede limit, karşı bölgeye en az 1:2 yer
+  +) Kırılım + geri test: Asya / Londra / New York / dünkü tepe-dip kırılıp geri test edilince fırsat
 
 Mesajlar:
   İZLEMEDE   : fiyat bölgeye geldi, ne beklendiği ve neyin iptal ettireceği
@@ -56,7 +56,7 @@ SETTINGS = {
     "base_mult": 0.6,         # baz mum gövdesi <= 1s ATR x bu
     "max_zones": 8,           # taraf başına en fazla aktif bölge
     "max_tests": 2,           # bölgenin 1. ve 2. testi kurulum üretebilir (senin retest mantığın)
-    "use_killzone": True,     # teyit sadece seans saatlerinde
+    "use_killzone": False,    # True yaparsan fırsatlar sadece seans saatlerinde gelir
     "killzones": [("02:00", "05:00", "Londra"), ("07:00", "11:30", "New York")],  # New York saati
     "require_sweep": False,   # True: süpürme şart. False: süpürme kaliteyi artırır
     "mss_mult": 0.6,          # MSS mumu gövdesi >= 15dk ATR x bu
@@ -67,25 +67,35 @@ SETTINGS = {
     "trade_bars": 192,        # açık işlemi en fazla izleme süresi (192 = 2 gün)
     "buf_mult": 0.5,          # stop tamponu = 15dk ATR x bu
     "min_rr": 2.0,            # karşı bölgeye en az R:R
+    "use_retest": True,       # seans tepe/diplerinde kırılım + geri test fırsatları
+    "retest_bars": 32,        # kırılımdan sonra geri test bekleme (32 = 8 saat)
+    "retest_levels": ("Londra", "New York", "Dünkü"),  # takip edilen seans seviyeleri
+    "break_mult": 0.8,        # kırılım mumu gövdesi >= 15dk ATR x bu (güçlü kırılım)
+    "away_mult": 1.0,         # geri testten önce seviyeden en az ATR x bu uzaklaşmalı
+    "fail_mult": 1.5,         # seviyenin ATR x bu kadar ötesinde kapanış = kırılım başarısız
 }
 
 # Rapor modunda karşılaştırılacak ayar setleri
 VARIANTS = {
     "Dengeli (aktif)": {},
-    "Katı (eski ayarlar)": {"max_tests": 1, "require_sweep": True, "mss_mult": 0.8, "disp_mult": 1.2,
+    "Katı (eski ayarlar)": {"use_killzone": True, "use_retest": False, "max_tests": 1, "require_sweep": True, "mss_mult": 0.8, "disp_mult": 1.2,
                             "base_mult": 0.5, "piv_len": 3, "watch_bars": 24,
                             "killzones": [("02:00", "05:00", "Londra"), ("09:30", "11:00", "NY AM")]},
-    "Killzone'suz": {"use_killzone": False},
-    "Gevşek": {"use_killzone": False, "mss_mult": 0.4, "disp_mult": 0.8, "min_rr": 1.5},
+    "Sadece bölgeden dönüş": {"use_retest": False},
+    "Sadece seans saatleri": {"use_killzone": True},
+    "Gevşek": {"mss_mult": 0.4, "disp_mult": 0.8, "min_rr": 1.5},
 }
 
 SEND_WATCH_ALERTS = True      # "İZLEMEDE" açıklama mesajları
 SEND_CHARTS = True            # İZLEMEDE ve KURULUM mesajlarıyla birlikte grafik resmi gönder
-WATCH_ONLY_IN_KILLZONE = True # izleme mesajı sadece seans saatlerinde gelsin (gece rahatsız etmez)
-SEND_CANCEL_ALERTS = True     # iptal / izleme bitti mesajları
+WATCH_ONLY_IN_KILLZONE = False # izleme mesajı sadece seans saatlerinde gelsin (gece rahatsız etmez)
+SEND_CANCEL_ALERTS = True     # açık fırsat iptal olunca haber ver (bekleyen emrini silmen için)
+SEND_GIVEUP_ALERTS = False    # "fikrinden vazgeçtim" mesajları (saatlik durum zaten anlatıyor)
 SEND_RESULT_ALERTS = True     # TP1 / TP2 / stop mesajları
 ALERT_LOOKBACK_HOURS = 3      # son kaç saatteki olaylar bildirilsin (gecikmelere karşı)
 DAILY_BRIEF_TR_HOUR = 8       # günlük özet saati (Türkiye saati)
+HOURLY_STATUS = True          # her saat başı sade dille durum mesajı
+HOURLY_HOURS_TR = range(8, 24)  # saatlik mesajların geleceği saatler (Türkiye saati, 08:00-23:00)
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.json")
 
 NY = ZoneInfo("America/New_York")
@@ -158,7 +168,7 @@ class Zone:
     used: bool = False
 
 
-PRICE_FIELDS = ("ztop", "zbot", "ref_h", "ref_l", "invalid", "entry", "stop", "tp1", "tp2", "opp")
+PRICE_FIELDS = ("ztop", "zbot", "ref_h", "ref_l", "invalid", "entry", "stop", "tp1", "tp2", "opp", "lvl", "rlow")
 
 
 def bias_by_bar(df15: pd.DataFrame, s: dict) -> np.ndarray:
@@ -226,6 +236,41 @@ def _eval_rr(H, L, i0, entry, stop, rr, max_bars):
     return None
 
 
+SESSIONS = [("Asya", "20:00", "24:00"), ("Londra", "02:00", "05:00"), ("New York", "09:30", "11:00")]
+
+
+def session_levels(df: pd.DataFrame):
+    """Seans tepeleri (alış koordinatında) ve dünkü tepe. [(bitiş zamanı, seviye, ad)]"""
+    ny = df.index.tz_convert(NY)
+    hm = ny.hour * 60 + ny.minute
+    H = df["high"].values
+    names = np.array([None] * len(df), dtype=object)
+    for nm, a, b in SESSIONS:
+        ha, ma = map(int, a.split(":"))
+        hb, mb = map(int, b.split(":"))
+        mask = (hm >= ha * 60 + ma) & (hm < hb * 60 + mb)
+        names[mask] = nm
+    out = []
+    idx = df.index
+    k = 0
+    while k < len(df):
+        nm = names[k]
+        j = k
+        while (j + 1 < len(df) and names[j + 1] == nm
+               and (idx[j + 1] - idx[j]) <= pd.Timedelta("1h")):
+            j += 1
+        if nm is not None:
+            out.append((idx[j] + BAR, float(H[k:j + 1].max()), nm))
+        k = j + 1
+    # dünkü tepe (New York günü)
+    day = pd.Series(H, index=df.index).groupby(ny.date).agg(["max"])
+    last_idx = pd.Series(df.index, index=df.index).groupby(ny.date).max()
+    for d0 in day.index[:-1]:
+        out.append((last_idx[d0] + BAR, float(day.loc[d0, "max"]), "Dünkü"))
+    out.sort(key=lambda r: r[0])
+    return out
+
+
 def run_side(df: pd.DataFrame, s: dict, use_kz: bool, bias: np.ndarray):
     """Tek taraf (alış koordinatında). Olaylar, işlemler ve son durumu döndürür."""
     n = len(df)
@@ -235,12 +280,14 @@ def run_side(df: pd.DataFrame, s: dict, use_kz: bool, bias: np.ndarray):
     ph, pl = pivots(H, L, s["piv_len"])
     p = s["piv_len"]
     zev = zone_events(df, s)
-    zi = 0
+    lev = session_levels(df) if s.get("use_retest", True) else []
+    zi = li = 0
 
     own, opp = [], []
     last_ph = last_pl = np.nan
-    events, trades, open_trades = [], [], []
+    events, trades, open_trades, armed = [], [], [], []
     pl_list = []          # (dip değeri, dibin oluştuğu mum)
+    levels = []           # seans seviyeleri: dict(lvl, name, born, state, ...)
     W = dict(state=0)
 
     def push(arr, z):
@@ -252,30 +299,48 @@ def run_side(df: pd.DataFrame, s: dict, use_kz: bool, bias: np.ndarray):
         tops = [z.bot for z in opp if z.bot > entry]
         return min(tops) if tops else None
 
+    def make_setup(i, e, st, extra):
+        """Ortak kurulum: karşı bölge kontrolü + kalite. None = yer yok."""
+        r = e - st
+        if r <= 0:
+            return None, None
+        o = nearest_opp(e)
+        room = None if o is None else (o - e) / r
+        if room is not None and room < s["min_rr"]:
+            return None, room
+        ev = dict(kind="SETUP", i=i, time=t[i], entry=e, stop=st, risk=r, tp1=e + 2 * r, tp2=e + 3 * r,
+                  room=room, opp=o, **extra)
+        return ev, room
+
     for i in range(2, n):
         ti = t[i]
-        # 1) Yeni 1s bölgeler (sadece kapanmış 1s mumlardan)
+        a_i = A[i] if not np.isnan(A[i]) else 0.0
+        buf = s["buf_mult"] * a_i
+        kz_ok = (not use_kz) or in_killzone(ti, s)
+        bias_ok = (not s["use_bias"]) or bias[i] == 1
+        not_against = (not s["use_bias"]) or bias[i] != -1
+
+        # 1) Yeni 1s bölgeler ve seans seviyeleri (sadece kapanmış olanlar)
         while zi < len(zev) and zev[zi][0] <= ti:
             end, kind, top, bot = zev[zi]
             push(own if kind == "own" else opp, Zone(top, bot, end))
             zi += 1
+        while li < len(lev) and lev[li][0] <= ti:
+            end, lvl, name = lev[li]
+            if C[i - 1] < lvl and name in s.get("retest_levels", ("Londra", "New York", "Dünkü")):
+                levels.append(dict(lvl=lvl, name=name, born=end, state="fresh"))
+            li += 1
 
         # 2) 15dk salınımlar
         if not np.isnan(ph[i]):
             last_ph = ph[i]
-            # İzleme sırasında oluşan tepki tepesi yeni kırılım seviyesi olur
             if W["state"] == 1 and (i - p) >= W["start"]:
-                W["ref_h"] = ph[i]
+                W["ref_h"] = ph[i]      # bölgeden ilk tepkinin tepesi yeni kırılım seviyesi olur
         if not np.isnan(pl[i]):
             last_pl = pl[i]
             pl_list.append((pl[i], i - p))
             if len(pl_list) > 200:
                 pl_list.pop(0)
-
-        a_i = A[i] if not np.isnan(A[i]) else 0.0
-        buf = s["buf_mult"] * a_i
-        kz_ok = (not use_kz) or in_killzone(ti, s)
-        bias_ok = (not s["use_bias"]) or bias[i] == 1
 
         # 3) Bölgeler: geçersiz kılma + test sayımı
         for z in list(opp):
@@ -288,7 +353,6 @@ def run_side(df: pd.DataFrame, s: dict, use_kz: bool, bias: np.ndarray):
             if L[i] <= z.top and L[i - 1] > z.top:
                 z.tests += 1
                 if (W["state"] == 0 and not z.used and z.tests <= s["max_tests"] and bias_ok):
-                    # Likidite: son 2 günde oluşmuş, şu anki fiyatın altındaki en yakın salınım dibi
                     cands = [v for v, b in pl_list if b >= i - 192 and v < L[i]]
                     liq = max(cands) if cands else np.nan
                     W = dict(state=1, zone=z, start=i, sweep=L[i], ref_h=last_ph, ref_l=liq,
@@ -297,7 +361,7 @@ def run_side(df: pd.DataFrame, s: dict, use_kz: bool, bias: np.ndarray):
                                        test_no=z.tests, ref_h=last_ph, ref_l=liq,
                                        invalid=z.bot - buf, kz_now=in_killzone(ti, s)))
 
-        # 4) İzleme: teyit bekleniyor
+        # 4) Bölge akışı: tepki + kırılım bekleniyor
         if W["state"] == 1:
             z = W["zone"]
             W["sweep"] = min(W["sweep"], L[i])
@@ -311,62 +375,120 @@ def run_side(df: pd.DataFrame, s: dict, use_kz: bool, bias: np.ndarray):
                 W = dict(state=0)
             else:
                 ref_h, ref_l = W["ref_h"], W["ref_l"]
-                # Süpürme = dibin altına iğne atıp tekrar üstünde kapanmak (stoplar alınıp geri dönüldü)
                 lvl_sweep = (not np.isnan(ref_l)) and L[i] < ref_l and C[i] > ref_l
-                prev_min = L[max(0, i - 96):i].min()          # son 24 saatin dibi
+                prev_min = L[max(0, i - 96):i].min()
                 day_sweep = L[i] < prev_min and C[i] > prev_min
                 if lvl_sweep or day_sweep:
                     W["swept"] = True
                     W["swept_lvl"] = ref_l if lvl_sweep else prev_min
                 swept = W["swept"]
                 mss = (not np.isnan(ref_h)) and C[i] > ref_h and (C[i] - O[i]) >= s["mss_mult"] * a_i
-                if mss and bias_ok and kz_ok and (swept or not s["require_sweep"]):
+                if mss and bias_ok and kz_ok and (swept or not s["require_sweep"]) and not armed:
                     fvg = L[i] > H[i - 2]
                     e = L[i] if fvg else (O[i] + C[i]) / 2
-                    st = W["sweep"] - buf
-                    r = e - st
-                    o = nearest_opp(e)
-                    room = None if o is None else (o - e) / r if r > 0 else None
-                    if r <= 0:
-                        W = dict(state=0)
-                    elif room is not None and room < s["min_rr"]:
-                        z.used = True
-                        events.append(dict(kind="UNWATCH", i=i, time=ti, ztop=z.top, zbot=z.bot, watch_time=W["wt"],
-                                           reason=f"Kırılım geldi ama önündeki karşı bölge çok yakın ({room:.1f}R). "
-                                                  f"1:2 kazanç yeri yok, işlem değmez."))
-                        W = dict(state=0)
+                    ev, room = make_setup(i, e, W["sweep"] - buf, dict(
+                        setup="ZONE", ztop=z.top, zbot=z.bot, test_no=W["test_no"], swept=swept,
+                        ref_h=ref_h, ref_l=W["swept_lvl"] if swept else ref_l, fvg=fvg))
+                    z.used = True
+                    if ev is None:
+                        if room is not None:
+                            events.append(dict(kind="UNWATCH", i=i, time=ti, ztop=z.top, zbot=z.bot,
+                                               watch_time=W["wt"],
+                                               reason=f"Kırılım geldi ama önündeki karşı bölge çok yakın "
+                                                      f"({room:.1f}R). 1:2 kazanç yeri yok, işlem değmez."))
                     else:
-                        z.used = True
                         score = int(swept) + int(W["test_no"] == 1) + int(fvg) + int(room is None or room >= 3)
-                        grade = "A" if score >= 3 else ("B" if score == 2 else "C")
-                        ev = dict(kind="SETUP", i=i, time=ti, entry=e, stop=st, risk=r,
-                                  tp1=e + 2 * r, tp2=e + 3 * r, room=room, opp=o,
-                                  ztop=z.top, zbot=z.bot, test_no=W["test_no"], swept=swept,
-                                  ref_h=ref_h, ref_l=W["swept_lvl"] if swept else ref_l, fvg=fvg, grade=grade, score=score)
+                        ev["grade"] = "A" if score >= 3 else ("B" if score == 2 else "C")
+                        ev["score"] = score
                         events.append(ev)
-                        W = dict(state=2, setup=ev, arm=i)
+                        armed.append(dict(ev=ev, arm=i))
+                    W = dict(state=0)
 
-        # 5) Kurulum hazır: girişe geri çekilme bekleniyor
-        elif W["state"] == 2:
-            ev = W["setup"]
+        # 5) Kırılım + geri test akışı (seans tepeleri)
+        for lv in list(levels):
+            if ti - lv["born"] > pd.Timedelta("30h") and lv["state"] == "fresh":
+                levels.remove(lv)
+                continue
+            if lv["state"] == "fresh":
+                if C[i] > lv["lvl"] and not ((C[i] - O[i]) >= s.get("break_mult", 0.8) * a_i and C[i] > lv["lvl"] + 0.2 * a_i):
+                    lv["clean"] = False       # güçlü olmayan bir mumla üstünde kapandı
+                if C[i] > lv["lvl"] and lv.get("clean", True) is False:
+                    levels.remove(lv)          # zayıf kırılım: takip etme
+                    continue
+                if C[i] > lv["lvl"] + 0.2 * a_i and (C[i] - O[i]) >= s.get("break_mult", 0.8) * a_i:
+                    # aynı yerdeki başka bir kırılmış seviyeyi tekrar takip etme
+                    dup = any(o is not lv and o["state"] in ("broken", "retest") and abs(o["lvl"] - lv["lvl"]) < 0.5 * a_i
+                              for o in levels)
+                    if dup:
+                        levels.remove(lv)
+                        continue
+                    lv.update(state="broken", bi=i, bt=ti, rlow=np.inf, away=False)
+                    if bias_ok:
+                        lv["announced"] = True
+                        events.append(dict(kind="BREAK", i=i, time=ti, lvl=lv["lvl"], name=lv["name"],
+                                           invalid=lv["lvl"] - s.get("fail_mult", 1.5) * a_i, kz_now=in_killzone(ti, s)))
+                continue
+            # kırılmış: önce seviyeden uzaklaşmalı, sonra geri test gelmeli
+            if H[i] >= lv["lvl"] + s.get("away_mult", 1.0) * a_i:
+                lv["away"] = True
+            if lv["away"] and L[i] <= lv["lvl"] + 0.3 * a_i:
+                lv["state"] = "retest"
+            if lv["state"] == "retest":
+                lv["rlow"] = min(lv["rlow"], L[i])
+            if C[i] < lv["lvl"] - s.get("fail_mult", 1.5) * a_i or i - lv["bi"] > s.get("retest_bars", 32):
+                if lv.get("announced"):
+                    why = ("15dk'lık mum seviyenin belirgin şekilde altında kapandı, kırılım başarısız."
+                           if C[i] < lv["lvl"] - s.get("fail_mult", 1.5) * a_i else
+                           f"{s.get('retest_bars', 32) * 15 // 60} saat içinde beklediğim geri test gelmedi.")
+                    events.append(dict(kind="RFAIL", i=i, time=ti, lvl=lv["lvl"], name=lv["name"],
+                                       watch_time=lv["bt"], reason=why))
+                levels.remove(lv)
+                continue
+            if (lv["state"] == "retest" and C[i] > lv["lvl"] and C[i] > O[i] and (C[i] - O[i]) >= 0.4 * a_i
+                    and bias_ok and kz_ok and not armed):
+                swept = lv["rlow"] < lv["lvl"] - 0.2 * a_i      # seviyenin altına sarkıp geri alındı
+                e = max(lv["lvl"], (O[i] + C[i]) / 2)
+                ev, room = make_setup(i, e, lv["rlow"] - buf, dict(
+                    setup="RETEST", lvl=lv["lvl"], name=lv["name"], rlow=lv["rlow"], swept=swept,
+                    fvg=False, ztop=None, zbot=None, trend=int(bias[i])))
+                levels.remove(lv)
+                if ev is None:
+                    if room is not None and lv.get("announced"):
+                        events.append(dict(kind="RFAIL", i=i, time=ti, lvl=lv["lvl"], name=lv["name"],
+                                           watch_time=lv["bt"],
+                                           reason=f"Geri testten döndü ama önündeki karşı bölge çok yakın ({room:.1f}R). "
+                                                  f"1:2 kazanç yeri yok."))
+                    continue
+                score = (int(swept) + int(lv["name"] in ("Londra", "Dünkü", "New York"))
+                         + int(bias[i] == 1 or not s["use_bias"]) + int(room is None or room >= 3))
+                ev["grade"] = "A" if score >= 3 else ("B" if score == 2 else "C")
+                ev["score"] = score
+                events.append(ev)
+                armed.append(dict(ev=ev, arm=i))
+
+        # 6) Kurulum hazır: girişe gelmesi bekleniyor
+        for a in list(armed):
+            ev = a["ev"]
+            if a["arm"] == i:
+                continue
             if L[i] <= ev["entry"]:
                 events.append(dict(kind="ENTRY", i=i, time=ti, entry=ev["entry"], stop=ev["stop"],
                                    tp1=ev["tp1"], tp2=ev["tp2"], risk=ev["risk"], grade=ev["grade"]))
                 tr = dict(i=i, entry=ev["entry"], stop=ev["stop"], risk=ev["risk"], tp1=ev["tp1"],
-                          tp2=ev["tp2"], grade=ev["grade"], tp1_hit=False, managed=None)
+                          tp2=ev["tp2"], grade=ev["grade"], setup=ev["setup"], tp1_hit=False, managed=None)
                 trades.append(tr)
                 open_trades.append(tr)
-                W = dict(state=0)
+                armed.remove(a)
             elif H[i] >= ev["tp1"]:
                 events.append(dict(kind="CANCEL", i=i, time=ti, entry=ev["entry"],
                                    reason="Fiyat girişe gelmeden TP1'e gitti, fırsat kaçtı."))
-                W = dict(state=0)
-            elif i - W["arm"] > s["arm_bars"]:
+                armed.remove(a)
+            elif i - a["arm"] > s["arm_bars"]:
                 events.append(dict(kind="CANCEL", i=i, time=ti, entry=ev["entry"],
                                    reason=f"{s['arm_bars'] * 15 // 60} saat içinde girişe gelmedi."))
-                W = dict(state=0)
+                armed.remove(a)
 
-        # 6) Açık işlemlerin takibi (TP1'de yarısı + stop girişe, TP2'de kalanı)
+        # 7) Açık işlemlerin takibi (TP1'de yarısı + stop girişe, TP2'de kalanı)
         for tr in list(open_trades):
             if not tr["tp1_hit"]:
                 if L[i] <= tr["stop"]:
@@ -400,7 +522,10 @@ def run_side(df: pd.DataFrame, s: dict, use_kz: bool, bias: np.ndarray):
         tr["r2"] = _eval_rr(H, L, tr["i"], tr["entry"], tr["stop"], 2.0, s["trade_bars"])
         tr["r3"] = _eval_rr(H, L, tr["i"], tr["entry"], tr["stop"], 3.0, s["trade_bars"])
 
-    return events, trades, dict(own=own, opp=opp, watch=W, open_trades=open_trades)
+    # son durumdaki seviyeler (saatlik özet için)
+    lv_state = [dict(lvl=lv["lvl"], name=lv["name"], state=lv["state"]) for lv in levels]
+    return events, trades, dict(own=own, opp=opp, watch=W, open_trades=open_trades,
+                                armed=[a["ev"] for a in armed], levels=lv_state)
 
 
 def _flip_event(ev):
@@ -408,7 +533,7 @@ def _flip_event(ev):
     for k in PRICE_FIELDS:
         if k in ev and ev[k] is not None and not (isinstance(ev[k], float) and np.isnan(ev[k])):
             ev[k] = -ev[k]
-    if "ztop" in ev and "zbot" in ev:
+    if ev.get("ztop") is not None and ev.get("zbot") is not None:
         ev["ztop"], ev["zbot"] = ev["zbot"], ev["ztop"]
     return ev
 
@@ -425,23 +550,30 @@ def run_strategy(df: pd.DataFrame, s: dict, use_kz: bool = True):
     events = sorted(ev_l + ev_s, key=lambda e: (e["i"], e["dir"]))
     trades = [dict(tr, dir="L") for tr in tr_l] + [dict(tr, dir="S") for tr in tr_s]
 
-    # Özet için orijinal koordinatlarda bölgeler ve durum
     demand = [(z.bot, z.top, z.tests) for z in st_l["own"]]
     supply = [(z.bot, z.top, z.tests) for z in st_l["opp"]]
 
     def watch_info(W, flip):
-        if W["state"] == 0:
+        if W["state"] != 1:
             return None
-        if W["state"] == 1:
-            lvl = W["ref_h"]
-            return dict(state=1, level=None if np.isnan(lvl) else (-lvl if flip else lvl))
-        e = W["setup"]["entry"]
-        return dict(state=2, level=-e if flip else e)
+        lvl = W["ref_h"]
+        z = W["zone"]
+        zb, zt = (-z.top, -z.bot) if flip else (z.bot, z.top)
+        return dict(level=None if np.isnan(lvl) else (-lvl if flip else lvl), zbot=zb, ztop=zt)
 
-    snap = dict(last_time=df.index[-1], last_close=float(df["close"].iloc[-1]), bias=int(bias[-1]),
-                in_kz=in_killzone(df.index[-1] + BAR, s), demand=demand, supply=supply,
-                long=watch_info(st_l["watch"], False), short=watch_info(st_s["watch"], True),
-                open_trades=len(st_l["open_trades"]) + len(st_s["open_trades"]))
+    def levels_info(lvls, flip):
+        return [dict(lvl=-x["lvl"] if flip else x["lvl"], name=x["name"], state=x["state"]) for x in lvls]
+
+    C = df["close"].values
+    snap = dict(
+        last_time=df.index[-1], last_close=float(C[-1]),
+        chg_1h=float(C[-1] / C[-5] - 1) if len(C) > 5 else 0.0,
+        bias=int(bias[-1]), in_kz=in_killzone(df.index[-1] + BAR, s), demand=demand, supply=supply,
+        long=watch_info(st_l["watch"], False), short=watch_info(st_s["watch"], True),
+        armed=[dict(dir="L", entry=e["entry"]) for e in st_l["armed"]] +
+              [dict(dir="S", entry=-e["entry"]) for e in st_s["armed"]],
+        levels_long=levels_info(st_l["levels"], False), levels_short=levels_info(st_s["levels"], True),
+        open_trades=len(st_l["open_trades"]) + len(st_s["open_trades"]))
     return events, trades, snap
 
 
@@ -480,7 +612,7 @@ def render_chart(name, cfg, df, ev, title):
         labels.append([y, y, f"{label} {fmt(y, d)}", color, bold])
 
     # Bölge kutusu
-    if True:
+    if ev.get("ztop") is not None and ev.get("zbot") is not None:
         zcol = UP if long else DN
         ax.add_patch(Rectangle((-0.5, ev["zbot"]), n, ev["ztop"] - ev["zbot"], color=zcol, alpha=0.13, lw=0, zorder=1))
         ax.text(0.5, ev["ztop"] if long else ev["zbot"], " TALEP BÖLGESİ (1s)" if long else " ARZ BÖLGESİ (1s)",
@@ -504,22 +636,35 @@ def render_chart(name, cfg, df, ev, title):
     # Olay mumu işareti
     ax.axvline(x_ev, color=MUTED, lw=0.8, ls=":", zorder=1)
 
+    YEL = "#c99a00"
+    if ev.get("lvl") is not None:
+        nm = ev.get("name", "")
+        lname = ("Dünkü tepe" if long else "Dünkü dip") if nm == "Dünkü" else f"{nm} {'tepesi' if long else 'dibi'}"
+        hline(ev["lvl"], 0, YEL, "-", lname, bold=True)
     if ev["kind"] == "WATCH":
         hline(ev.get("ref_h"), max(0, x_ev - 12), BLUE, "--", "Kırılırsa ALIŞ" if long else "Kırılırsa SATIŞ", bold=True)
         hline(ev.get("ref_l"), max(0, x_ev - 12), PUR, ":", "Likidite")
         hline(ev.get("invalid"), x_ev, DN, "-", "Altında kapanırsa vazgeç" if long else "Üstünde kapanırsa vazgeç")
+    elif ev["kind"] == "BREAK":
+        hline(ev.get("invalid"), x_ev, DN, "-", "Altında kapanırsa vazgeç" if long else "Üstünde kapanırsa vazgeç")
+        ax.annotate("Buraya geri gelip dönerse " + ("ALIŞ" if long else "SATIŞ"),
+                    xy=(n - 2, ev["lvl"]), xytext=(n * 0.62, ev["lvl"] + (-1 if long else 1) * (H.max() - L.min()) * 0.18),
+                    ha="center", fontsize=10.5, color=INK, fontweight="bold", zorder=7,
+                    bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="#d0d4dc"),
+                    arrowprops=dict(arrowstyle="-|>", color=INK, lw=1.1))
     else:
-        hline(ev.get("ref_h"), max(0, x_ev - 12), BLUE, "--", "Kırılan seviye")
-        if ev.get("swept"):
-            hline(ev.get("ref_l"), max(0, x_ev - 16), PUR, ":", "Alınan likidite")
+        if ev.get("setup") != "RETEST":
+            hline(ev.get("ref_h"), max(0, x_ev - 12), BLUE, "--", "Kırılan seviye")
+            if ev.get("swept"):
+                hline(ev.get("ref_l"), max(0, x_ev - 16), PUR, ":", "Alınan likidite")
         hline(ev["entry"], x_ev, INK, "-", "GİRİŞ", bold=True)
         hline(ev["stop"], x_ev, DN, "-", "STOP", bold=True)
         hline(ev["tp1"], x_ev, UP, "--", "TP1 1:2", bold=True)
         hline(ev["tp2"], x_ev, UP, "-", "TP2 1:3", bold=True)
 
     # Eksenler
-    ys = [L.min(), H.max(), ev["zbot"], ev["ztop"]]
-    for k in ("tp2", "stop", "ref_h", "ref_l", "invalid"):
+    ys = [L.min(), H.max()]
+    for k in ("ztop", "zbot", "lvl", "tp2", "stop", "ref_h", "ref_l", "invalid"):
         v = ev.get(k)
         if v is not None and not (isinstance(v, float) and np.isnan(v)):
             ys.append(v)
@@ -592,10 +737,11 @@ def send_chart(name, cfg, df, ev):
         return
     try:
         side = "ALIŞ" if ev["dir"] == "L" else "SATIŞ"
-        if ev["kind"] == "WATCH":
+        if ev["kind"] in ("WATCH", "BREAK"):
             title = f"{name} | Takipte: {side} fırsatı olabilir"
         else:
-            title = f"{name} | {side} FIRSATI — Kalite {ev.get('grade', '')}"
+            kind = "kırılım + geri test" if ev.get("setup") == "RETEST" else "bölgeden dönüş"
+            title = f"{name} | {side} FIRSATI ({kind}) — Kalite {ev.get('grade', '')}"
         png = render_chart(name, cfg, df, ev, title)
         tg_send_photo(png, f"<b>{title}</b>")
     except Exception:  # noqa
@@ -792,28 +938,100 @@ def msg_watch(name, cfg, ev, use_kz):
     return "\n".join(lines)
 
 
+def approx(x, cfg):
+    """Okuması kolay yuvarlanmış fiyat."""
+    ax_ = abs(x)
+    if ax_ < 10:
+        v = f"{x:,.4f}"
+    elif ax_ < 1000:
+        v = f"{x:,.1f}"
+    elif ax_ < 10000:
+        v = f"{x:,.0f}"
+    else:
+        v = f"{round(x / 10) * 10:,.0f}"
+    return "~" + v
+
+
+def lvl_name(name, d):
+    if name == "Dünkü":
+        return "dünkü tepe" if d == "L" else "dünkü dip"
+    return f"{name} tepesi" if d == "L" else f"{name} dibi"
+
+
+def lvl_acc(name, d):
+    """'Londra tepesini' / 'dünkü dibi' gibi belirtme hali."""
+    if name == "Dünkü":
+        return "dünkü tepeyi" if d == "L" else "dünkü dibi"
+    return f"{name} tepesini" if d == "L" else f"{name} dibini"
+
+
+def msg_break(name, cfg, ev):
+    w = W_(ev["dir"])
+    up = ev["dir"] == "L"
+    ln = lvl_name(ev["name"], ev["dir"])
+    lines = [
+        f"<b>{name} | Takipte: {w['side']} fırsatı olabilir</b>",
+        f"Fiyat {lvl_acc(ev['name'], ev['dir'])} ({approx(ev['lvl'], cfg)}) {'yukarı' if up else 'aşağı'} kırdı.",
+        "",
+        f"<b>Beklediğim:</b> fiyatın geri gelip bu seviyeyi test etmesi ve buradan "
+        f"{'yukarı' if up else 'aşağı'} dönmesi. Olursa {w['side']} fırsatını giriş, stop ve hedefleriyle gönderirim.",
+        f"<b>Daha iyi olur:</b> fiyat seviyenin biraz {'altına sarkıp geri üstüne' if up else 'üstüne çıkıp geri altına'} "
+        f"dönerse (likidite alınmış olur).",
+        f"<b>Vazgeçerim:</b> 15dk'lık mum {approx(ev['invalid'], cfg)} {'altında' if up else 'üstünde'} kapanırsa "
+        f"ya da {SETTINGS.get('retest_bars', 32) * 15 // 60} saat içinde geri test gelmezse.",
+        "",
+        "Bu henüz işlem değil, sadece haber veriyorum.",
+    ]
+    return "\n".join(lines)
+
+
+def msg_rfail(name, cfg, ev):
+    w = W_(ev["dir"])
+    return (f"<b>{name} | {w['side']} fikrinden vazgeçtim</b>\n"
+            f"{(lambda x: x[0].upper() + x[1:])(lvl_name(ev['name'], ev['dir']))} ({approx(ev['lvl'], cfg)}): {ev['reason']}")
+
+
 def msg_setup(name, cfg, ev):
     d, w, u = cfg["digits"], W_(ev["dir"]), cfg.get("unit", "pip")
+    up = ev["dir"] == "L"
     dist = ev["risk"] / cfg["pip"]
-    bias_word = "yukarı" if ev["dir"] == "L" else "aşağı"
-    if ev["swept"] and _ok(ev["ref_l"]):
-        conf = (f"önce {fmt(ev['ref_l'], d)} likiditesi iğneyle alındı, sonra fiyat {fmt(ev['ref_h'], d)} "
-                f"{w['mss_word']} güçlü kapandı.")
-    else:
-        conf = f"fiyat {fmt(ev['ref_h'], d)} {w['mss_word']} güçlü kapandı. Likidite alınmadı."
-    entry_why = "güçlü mumun bıraktığı boşluk (FVG)" if ev["fvg"] else "güçlü mumun ortası"
-    stop_why = "iğnenin altı" if ev["dir"] == "L" else "iğnenin üstü"
-    if not ev["swept"]:
-        stop_why = "bölgedeki en düşük noktanın altı" if ev["dir"] == "L" else "bölgedeki en yüksek noktanın üstü"
+    bias_word = "yukarı" if up else "aşağı"
     room_txt = "önü açık" if ev["room"] is None else f"karşı bölgeye {ev['room']:.1f}R"
-    lines = [
-        f"<b>{name} | {w['side']} FIRSATI — Kalite {ev['grade']}</b>",
-        f"Mum: {tr_time(ev['time'])} (TR, 15dk)",
-        "",
-        "<b>Neden:</b>",
-        f"• Yön: 4 saatlik trend {bias_word}.",
-        f"• Bölge: 1 saatlik {w['zone']} bölgesi {fmt(ev['zbot'], d)} – {fmt(ev['ztop'], d)} ({ev['test_no']}. test).",
-        f"• Onay: {conf}",
+    if ev.get("setup") == "RETEST":
+        ln = lvl_name(ev["name"], ev["dir"])
+        trend_line = (f"• Yön: 4 saatlik trend {bias_word}." if ev.get("trend") == 1 else
+                      f"• Yön: 4 saatlik trend net değil ama {'aşağı' if up else 'yukarı'} da değil.")
+        conf = f"seviyeden güçlü bir {'yeşil' if up else 'kırmızı'} mumla {'yukarı' if up else 'aşağı'} döndü."
+        if ev["swept"]:
+            conf = (f"önce seviyenin {'altına sarkıp' if up else 'üstüne çıkıp'} likiditeyi aldı, sonra güçlü bir "
+                    f"{'yeşil' if up else 'kırmızı'} mumla geri {'üstüne' if up else 'altına'} döndü.")
+        why = [trend_line,
+               f"• Seviye: {ln} ({approx(ev['lvl'], cfg)}) {'yukarı' if up else 'aşağı'} kırıldı, sonra fiyat geri gelip test etti.",
+               f"• Onay: {conf}"]
+        entry_why = "seviye ile dönüş mumunun ortası"
+        stop_why = f"geri testteki en {'düşük' if up else 'yüksek'} noktanın {'altı' if up else 'üstü'}"
+        important = ev["name"] in ("Londra", "Dünkü", "New York")
+        quality = (f"Kalite {ev['grade']} ({ev['score']}/4): {'likidite alındı' if ev['swept'] else 'likidite alınmadı'} · "
+                   f"{'önemli seviye' if important else 'küçük seviye'} · "
+                   f"trend {'uyumlu' if ev.get('trend') == 1 else 'nötr'} · {room_txt}")
+        title = f"<b>{name} | {w['side']} FIRSATI (kırılım + geri test) — Kalite {ev['grade']}</b>"
+    else:
+        if ev["swept"] and _ok(ev["ref_l"]):
+            conf = (f"önce {fmt(ev['ref_l'], d)} likiditesi iğneyle alındı, sonra fiyat {fmt(ev['ref_h'], d)} "
+                    f"{w['mss_word']} güçlü kapandı.")
+        else:
+            conf = f"fiyat {fmt(ev['ref_h'], d)} {w['mss_word']} güçlü kapandı. Likidite alınmadı."
+        why = [f"• Yön: 4 saatlik trend {bias_word}.",
+               f"• Bölge: 1 saatlik {w['zone']} bölgesi {fmt(ev['zbot'], d)} – {fmt(ev['ztop'], d)} ({ev['test_no']}. test).",
+               f"• Onay: {conf}"]
+        entry_why = "güçlü mumun bıraktığı boşluk (FVG)" if ev["fvg"] else "güçlü mumun ortası"
+        stop_why = "iğnenin altı" if up else "iğnenin üstü"
+        if not ev["swept"]:
+            stop_why = "bölgedeki en düşük noktanın altı" if up else "bölgedeki en yüksek noktanın üstü"
+        quality = (f"Kalite {ev['grade']} ({ev['score']}/4): {'likidite alındı' if ev['swept'] else 'likidite alınmadı'} · "
+                   f"{ev['test_no']}. test · FVG {'var' if ev['fvg'] else 'yok'} · {room_txt}")
+        title = f"<b>{name} | {w['side']} FIRSATI (bölgeden dönüş) — Kalite {ev['grade']}</b>"
+    lines = [title, f"Mum: {tr_time(ev['time'])} (TR, 15dk)", "", "<b>Neden:</b>"] + why + [
         "",
         "<b>Plan:</b>",
         f"• Giriş (limit): <b>{fmt(ev['entry'], d)}</b> — {entry_why}",
@@ -826,8 +1044,7 @@ def msg_setup(name, cfg, ev):
         lines.append(f"• Önündeki {w['opp']} bölgesi: {fmt(ev['opp'], d)} ({ev['room']:.1f}R){warn}")
     lines += [
         "",
-        f"Kalite {ev['grade']} ({ev['score']}/4): {'likidite alındı' if ev['swept'] else 'likidite alınmadı'} · "
-        f"{ev['test_no']}. test · FVG {'var' if ev['fvg'] else 'yok'} · {room_txt}",
+        quality,
         f"Boşver: fiyat girişe gelmeden TP1'e giderse ya da {SETTINGS['arm_bars'] * 15 // 60} saat "
         f"içinde girişe gelmezse.",
         "",
@@ -877,34 +1094,69 @@ def msg_stop(name, cfg, ev):
             f"Kurallara uyduysan bu normal bir kayıp. Sıradaki fırsata.")
 
 
-MESSAGES = {"WATCH": msg_watch, "UNWATCH": msg_unwatch, "SETUP": msg_setup, "ENTRY": msg_entry,
+MESSAGES = {"WATCH": msg_watch, "UNWATCH": msg_unwatch, "BREAK": msg_break, "RFAIL": msg_rfail,
+            "SETUP": msg_setup, "ENTRY": msg_entry,
             "CANCEL": msg_cancel, "TP1": msg_tp1, "TP2": msg_tp2, "BE": msg_be, "STOP": msg_stop}
 
 
 def symbol_summary(name, cfg, snap):
-    d = cfg["digits"]
+    """Sade dille: trend, fiyat nerede, ne bekleniyor."""
     px = snap["last_close"]
-    b = {1: "YUKARI", -1: "AŞAĞI", 0: "BELİRSİZ"}[snap["bias"]]
-    below = [z for z in snap["demand"] if z[1] < px]
-    above = [z for z in snap["supply"] if z[0] > px]
-    nd = max(below, key=lambda z: z[1]) if below else None
-    ns = min(above, key=lambda z: z[0]) if above else None
-    lines = [f"<b>{name}</b> {fmt(px, d)} · 4s yön: {b}"]
-    lines.append(f"  Talep: {fmt(nd[0], d)}–{fmt(nd[1], d)} ({(px - nd[1]) / px * 100:.2f}% aşağıda, "
-                 f"{'taze' if nd[2] == 0 else str(nd[2]) + '. test sonrası'})" if nd else "  Talep: yakında aktif bölge yok")
-    lines.append(f"  Arz: {fmt(ns[0], d)}–{fmt(ns[1], d)} ({(ns[0] - px) / px * 100:.2f}% yukarıda, "
-                 f"{'taze' if ns[2] == 0 else str(ns[2]) + '. test sonrası'})" if ns else "  Arz: yakında aktif bölge yok")
-    for side, info in (("L", snap["long"]), ("S", snap["short"])):
+    trend = {1: "yukarı", -1: "aşağı", 0: "net değil"}[snap["bias"]]
+    head = f"<b>{name}</b> {approx(px, cfg)} · trend (4s): {trend} · son 1 saat {snap['chg_1h'] * 100:+.2f}%"
+    stale = pd.Timestamp.now(tz="UTC") - snap["last_time"] > pd.Timedelta("2h")
+    if stale:
+        return head + "\nPiyasa kapalı ya da veri gelmiyor, yeni bir şey yok."
+    lines = [head]
+    said = False
+    for a in snap["armed"]:
+        w = W_(a["dir"])
+        lines.append(f"{w['side']} fırsatı açık: fiyatın {approx(a['entry'], cfg)} girişine gelmesini bekliyorum.")
+        said = True
+    for d, lvls in (("L", snap["levels_long"]), ("S", snap["levels_short"])):
+        w = W_(d)
+        up = d == "L"
+        for lv in lvls:
+            ln = lvl_name(lv["name"], d)
+            if lv["state"] == "retest":
+                lines.append(f"{ln[0].upper() + ln[1:]} ({approx(lv['lvl'], cfg)}) {'yukarı' if up else 'aşağı'} kırıldı, "
+                             f"şimdi geri test ediyor. Buradan {'yukarı' if up else 'aşağı'} dönerse {w['side']} fırsatı veririm.")
+                said = True
+            elif lv["state"] == "broken":
+                lines.append(f"{ln[0].upper() + ln[1:]} ({approx(lv['lvl'], cfg)}) {'yukarı' if up else 'aşağı'} kırıldı. "
+                             f"Geri gelip bu seviyede tutunursa {w['side']} bakacağım.")
+                said = True
+    for d, info in (("L", snap["long"]), ("S", snap["short"])):
         if not info:
             continue
-        w = W_(side)
-        if info["state"] == 1:
-            lvl = f"{fmt(info['level'], d)} {w['mss_word']} kapanış" if info["level"] is not None else "yapı kırılımı"
-            lines.append(f"  Durum: {w['zone']} bölgesinde, {lvl} bekleniyor")
-        else:
-            lines.append(f"  Durum: {w['side']} fırsatı var, {fmt(info['level'], d)} girişine gelmesi bekleniyor")
+        w = W_(d)
+        lvl = f", {approx(info['level'], cfg)} {w['mss_word']} güçlü kapanış gelirse {w['side']}" if info["level"] is not None else ""
+        lines.append(f"Fiyat {w['zone']} bölgesinde ({approx(info['zbot'], cfg)} – {approx(info['ztop'], cfg)}){lvl}.")
+        said = True
+    if not said:
+        near = []
+        ups = [lv for lv in snap["levels_long"] if lv["state"] == "fresh" and lv["lvl"] > px]
+        dns = [lv for lv in snap["levels_short"] if lv["state"] == "fresh" and lv["lvl"] < px]
+        sup = [z for z in snap["supply"] if z[0] > px]
+        dem = [z for z in snap["demand"] if z[1] < px]
+        if ups:
+            u = min(ups, key=lambda x: x["lvl"])
+            near.append(f"yukarıda {lvl_name(u['name'], 'L')} {approx(u['lvl'], cfg)}")
+        if sup:
+            z = min(sup, key=lambda z: z[0])
+            near.append(f"yukarıda arz bölgesi {approx(z[0], cfg)}")
+        if dns:
+            dd = max(dns, key=lambda x: x["lvl"])
+            near.append(f"aşağıda {lvl_name(dd['name'], 'S')} {approx(dd['lvl'], cfg)}")
+        if dem:
+            z = max(dem, key=lambda z: z[1])
+            near.append(f"aşağıda talep bölgesi {approx(z[1], cfg)}")
+        txt = "Şu an net bir kurulum yok."
+        if near:
+            txt += " Takip ettiğim yerler: " + ", ".join(near[:3]) + ". Buralara gelirse haber veririm."
+        lines.append(txt)
     if snap["open_trades"]:
-        lines.append(f"  Açık takip edilen işlem: {snap['open_trades']}")
+        lines.append(f"Takip ettiğim açık işlem: {snap['open_trades']}")
     return "\n".join(lines)
 
 
@@ -952,9 +1204,11 @@ def analyze_all():
 
 
 def _enabled(kind):
-    if kind in ("WATCH",):
+    if kind in ("WATCH", "BREAK"):
         return SEND_WATCH_ALERTS
-    if kind in ("UNWATCH", "CANCEL"):
+    if kind in ("UNWATCH", "RFAIL"):
+        return SEND_GIVEUP_ALERTS
+    if kind == "CANCEL":
         return SEND_CANCEL_ALERTS
     if kind in ("TP1", "TP2", "BE", "STOP"):
         return SEND_RESULT_ALERTS
@@ -979,17 +1233,18 @@ def do_scan(state, results):
             key = f"{name}|{ev['kind']}|{ev['dir']}|{ev['time'].isoformat()}"
             if key in state["sent"]:
                 continue
-            if ev["kind"] == "WATCH" and WATCH_ONLY_IN_KILLZONE and use_kz_for(cfg, SETTINGS) and not ev["kz_now"]:
+            if ev["kind"] in ("WATCH", "BREAK") and WATCH_ONLY_IN_KILLZONE and use_kz_for(cfg, SETTINGS) and not ev["kz_now"]:
                 continue
-            if ev["kind"] == "UNWATCH":
-                wkey = f"{name}|WATCH|{ev['dir']}|{ev['watch_time'].isoformat()}"
+            if ev["kind"] in ("UNWATCH", "RFAIL"):
+                src = "WATCH" if ev["kind"] == "UNWATCH" else "BREAK"
+                wkey = f"{name}|{src}|{ev['dir']}|{ev['watch_time'].isoformat()}"
                 if wkey not in state["sent"]:
                     continue   # izleme mesajı gönderilmediyse bitiş mesajı da gönderilmez
             if ev["kind"] == "WATCH":
                 text = msg_watch(name, cfg, ev, use_kz_for(cfg, SETTINGS))
             else:
                 text = MESSAGES[ev["kind"]](name, cfg, ev)
-            if ev["kind"] in ("WATCH", "SETUP"):
+            if ev["kind"] in ("WATCH", "BREAK", "SETUP"):
                 send_chart(name, cfg, res["df"], ev)
             if tg_send(text) or not os.environ.get("TELEGRAM_TOKEN"):
                 state["sent"][key] = now.isoformat()
@@ -997,13 +1252,15 @@ def do_scan(state, results):
 
 def do_brief(results, title="Günlük özet"):
     today = dt.datetime.now(TR).strftime("%d.%m.%Y")
-    parts = [f"<b>{title} — {today}</b>\nSeans saatleri: {killzone_tr_text()}"]
+    head = f"<b>{title} — {today}</b>"
+    if SETTINGS["use_killzone"]:
+        head += f"\nSeans saatleri: {killzone_tr_text()}"
+    parts = [head]
     for name, res in results.items():
         if res["ok"]:
             parts.append(symbol_summary(name, SYMBOLS[name], res["snap"]))
         else:
             parts.append(f"<b>{name}</b>: veri alınamadı ({html.escape(res['error'][:200])})")
-    parts.append("Bu bir yatırım tavsiyesi değil; kurulumları kendi analizinle teyit et.")
     tg_send("\n\n".join(parts))
 
 
@@ -1089,7 +1346,14 @@ def main():
         do_scan(state, results)
         now_tr = dt.datetime.now(TR)
         today = now_tr.strftime("%Y-%m-%d")
-        if now_tr.hour >= DAILY_BRIEF_TR_HOUR and state["last_brief"] != today:
+        hour_key = now_tr.strftime("%Y-%m-%d %H")
+        if HOURLY_STATUS and now_tr.hour in HOURLY_HOURS_TR:
+            if state.get("last_hourly") != hour_key:
+                first = state["last_brief"] != today
+                do_brief(results, title="Günaydın, günün durumu" if first else f"Saatlik durum {now_tr:%H}:00")
+                state["last_hourly"] = hour_key
+                state["last_brief"] = today
+        elif now_tr.hour >= DAILY_BRIEF_TR_HOUR and state["last_brief"] != today:
             do_brief(results)
             state["last_brief"] = today
 
