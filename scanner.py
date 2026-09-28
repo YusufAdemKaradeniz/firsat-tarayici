@@ -95,7 +95,7 @@ SEND_RESULT_ALERTS = True     # TP1 / TP2 / stop mesajları
 ALERT_LOOKBACK_HOURS = 3      # son kaç saatteki olaylar bildirilsin (gecikmelere karşı)
 DAILY_BRIEF_TR_HOUR = 8       # günlük özet saati (Türkiye saati)
 HOURLY_STATUS = True          # her saat başı sade dille durum mesajı
-HOURLY_HOURS_TR = range(8, 24)  # saatlik mesajların geleceği saatler (Türkiye saati, 08:00-23:00)
+HOURLY_HOURS_TR = range(0, 24)  # saatlik mesajların geleceği saatler (Türkiye saati). 0-24 = 7/24
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.json")
 
 NY = ZoneInfo("America/New_York")
@@ -1100,64 +1100,31 @@ MESSAGES = {"WATCH": msg_watch, "UNWATCH": msg_unwatch, "BREAK": msg_break, "RFA
 
 
 def symbol_summary(name, cfg, snap):
-    """Sade dille: trend, fiyat nerede, ne bekleniyor."""
-    px = snap["last_close"]
-    trend = {1: "yukarı", -1: "aşağı", 0: "net değil"}[snap["bias"]]
-    head = f"<b>{name}</b> {approx(px, cfg)} · trend (4s): {trend} · son 1 saat {snap['chg_1h'] * 100:+.2f}%"
-    stale = pd.Timestamp.now(tz="UTC") - snap["last_time"] > pd.Timedelta("2h")
-    if stale:
-        return head + "\nPiyasa kapalı ya da veri gelmiyor, yeni bir şey yok."
-    lines = [head]
-    said = False
+    """Kısa: bu paritede şu an ne bekleniyor."""
+    head = f"<b>{name}</b> — "
+    if pd.Timestamp.now(tz="UTC") - snap["last_time"] > pd.Timedelta("2h"):
+        return head + "piyasa kapalı."
     for a in snap["armed"]:
         w = W_(a["dir"])
-        lines.append(f"{w['side']} fırsatı açık: fiyatın {approx(a['entry'], cfg)} girişine gelmesini bekliyorum.")
-        said = True
+        return head + f"<b>fırsat açık:</b> {w['side']}, {approx(a['entry'], cfg)} girişine gelmesini bekliyorum."
     for d, lvls in (("L", snap["levels_long"]), ("S", snap["levels_short"])):
         w = W_(d)
-        up = d == "L"
         for lv in lvls:
-            ln = lvl_name(lv["name"], d)
             if lv["state"] == "retest":
-                lines.append(f"{ln[0].upper() + ln[1:]} ({approx(lv['lvl'], cfg)}) {'yukarı' if up else 'aşağı'} kırıldı, "
-                             f"şimdi geri test ediyor. Buradan {'yukarı' if up else 'aşağı'} dönerse {w['side']} fırsatı veririm.")
-                said = True
-            elif lv["state"] == "broken":
-                lines.append(f"{ln[0].upper() + ln[1:]} ({approx(lv['lvl'], cfg)}) {'yukarı' if up else 'aşağı'} kırıldı. "
-                             f"Geri gelip bu seviyede tutunursa {w['side']} bakacağım.")
-                said = True
+                return head + (f"<b>beklediğim yerde:</b> {lvl_name(lv['name'], d)} ({approx(lv['lvl'], cfg)}) geri test ediliyor, "
+                               f"{'yukarı' if d == 'L' else 'aşağı'} dönerse {w['side']}.")
     for d, info in (("L", snap["long"]), ("S", snap["short"])):
-        if not info:
-            continue
+        if info:
+            w = W_(d)
+            return head + (f"<b>beklediğim yerde:</b> fiyat {w['zone']} bölgesinde ({approx(info['zbot'], cfg)} – "
+                           f"{approx(info['ztop'], cfg)}), {'yukarı' if d == 'L' else 'aşağı'} kırılım gelirse {w['side']}.")
+    for d, lvls in (("L", snap["levels_long"]), ("S", snap["levels_short"])):
         w = W_(d)
-        lvl = f", {approx(info['level'], cfg)} {w['mss_word']} güçlü kapanış gelirse {w['side']}" if info["level"] is not None else ""
-        lines.append(f"Fiyat {w['zone']} bölgesinde ({approx(info['zbot'], cfg)} – {approx(info['ztop'], cfg)}){lvl}.")
-        said = True
-    if not said:
-        near = []
-        ups = [lv for lv in snap["levels_long"] if lv["state"] == "fresh" and lv["lvl"] > px]
-        dns = [lv for lv in snap["levels_short"] if lv["state"] == "fresh" and lv["lvl"] < px]
-        sup = [z for z in snap["supply"] if z[0] > px]
-        dem = [z for z in snap["demand"] if z[1] < px]
-        if ups:
-            u = min(ups, key=lambda x: x["lvl"])
-            near.append(f"yukarıda {lvl_name(u['name'], 'L')} {approx(u['lvl'], cfg)}")
-        if sup:
-            z = min(sup, key=lambda z: z[0])
-            near.append(f"yukarıda arz bölgesi {approx(z[0], cfg)}")
-        if dns:
-            dd = max(dns, key=lambda x: x["lvl"])
-            near.append(f"aşağıda {lvl_name(dd['name'], 'S')} {approx(dd['lvl'], cfg)}")
-        if dem:
-            z = max(dem, key=lambda z: z[1])
-            near.append(f"aşağıda talep bölgesi {approx(z[1], cfg)}")
-        txt = "Şu an net bir kurulum yok."
-        if near:
-            txt += " Takip ettiğim yerler: " + ", ".join(near[:3]) + ". Buralara gelirse haber veririm."
-        lines.append(txt)
-    if snap["open_trades"]:
-        lines.append(f"Takip ettiğim açık işlem: {snap['open_trades']}")
-    return "\n".join(lines)
+        for lv in lvls:
+            if lv["state"] == "broken":
+                return head + (f"<b>takipte:</b> {lvl_name(lv['name'], d)} ({approx(lv['lvl'], cfg)}) kırıldı, "
+                               f"geri gelip test etmesini bekliyorum ({w['side']}).")
+    return head + "taktiğimize uygun bir şey yok, bekliyorum."
 
 
 # =====================================================================
@@ -1251,17 +1218,14 @@ def do_scan(state, results):
 
 
 def do_brief(results, title="Günlük özet"):
-    today = dt.datetime.now(TR).strftime("%d.%m.%Y")
-    head = f"<b>{title} — {today}</b>"
-    if SETTINGS["use_killzone"]:
-        head += f"\nSeans saatleri: {killzone_tr_text()}"
-    parts = [head]
+    now = dt.datetime.now(TR).strftime("%d.%m %H:%M")
+    lines = [f"<b>{title}</b> ({now})"]
     for name, res in results.items():
         if res["ok"]:
-            parts.append(symbol_summary(name, SYMBOLS[name], res["snap"]))
+            lines.append(symbol_summary(name, SYMBOLS[name], res["snap"]))
         else:
-            parts.append(f"<b>{name}</b>: veri alınamadı ({html.escape(res['error'][:200])})")
-    tg_send("\n\n".join(parts))
+            lines.append(f"<b>{name}</b> — veri alınamadı.")
+    tg_send("\n".join(lines))
 
 
 def _stats(vals):
@@ -1275,46 +1239,34 @@ def _stats(vals):
 def do_report(results):
     ok = {n: r for n, r in results.items() if r["ok"]}
     if not ok:
-        tg_send("<b>Rapor:</b> hiçbir enstrümanın verisi alınamadı.")
+        tg_send("<b>Rapor:</b> veri alınamadı.")
         return
     weeks = max(1e-9, np.mean([(r["df"].index[-1] - r["df"].index[0]).days / 7 for r in ok.values()]))
-    parts = [f"<b>Geçmiş test raporu</b> (son ~{weeks:.1f} hafta, 15dk, {len(ok)} enstrüman)\n"
-             "Yönetim: TP1'de yarısı kapanır, stop girişe çekilir, kalan TP2'ye. "
-             "Aynı mumda stop ve hedef varsa stop sayıldı. Spread/komisyon dahil değil."]
 
+    def line(trades, setups):
+        v = [t["managed"] for t in trades if t["managed"] is not None]
+        if not v:
+            return f"{setups} fırsat (haftada ~{setups / weeks:.1f}), sonuçlanan işlem yok"
+        w = sum(1 for x in v if x > 0)
+        return (f"{setups} fırsat (haftada ~{setups / weeks:.1f}) · {len(v)} işlem · "
+                f"%{w / len(v) * 100:.0f} kazanç · toplam {sum(v):+.1f}R")
+
+    out = [f"<b>Geçmiş test</b> (son ~{weeks:.0f} hafta)"]
     for vname, over in VARIANTS.items():
         s = dict(SETTINGS, **over)
-        setups, trades = 0, []
-        per_sym = []
+        setups, trades, per = 0, [], []
         for name, r in ok.items():
-            if not over:
-                ev, tr = r["events"], r["trades"]
-            else:
-                ev, tr, _ = run_strategy(r["df"], s, use_kz_for(SYMBOLS[name], s))
+            ev, tr = (r["events"], r["trades"]) if not over else run_strategy(r["df"], s, use_kz_for(SYMBOLS[name], s))[:2]
             n_set = sum(1 for e in ev if e["kind"] == "SETUP")
             setups += n_set
             trades += tr
-            per_sym.append((name, n_set, tr))
-        lines = [f"<b>{vname}</b>: {setups} kurulum (haftada ~{setups / weeks:.1f}), {len(trades)} doldu",
-                 f"  Yönetimli: {_stats([t['managed'] for t in trades])}",
-                 f"  Sabit 1:2: {_stats([t['r2'] for t in trades])}",
-                 f"  Sabit 1:3: {_stats([t['r3'] for t in trades])}"]
+            per.append((name, n_set, tr))
+        out.append(f"<b>{vname}:</b> {line(trades, setups)}")
         if not over:
-            for g in ("A", "B", "C"):
-                gt = [t for t in trades if t["grade"] == g]
-                if gt:
-                    lines.append(f"  Kalite {g}: {_stats([t['managed'] for t in gt])}")
-            lines.append("  Enstrüman bazında (yönetimli):")
-            for name, n_set, tr in per_sym:
-                lines.append(f"   {name}: {n_set} kurulum · {_stats([t['managed'] for t in tr])}")
-        parts.append("\n".join(lines))
-
-    for name, r in results.items():
-        if not r["ok"]:
-            parts.append(f"{name}: veri alınamadı ({html.escape(r['error'][:150])})")
-    parts.append("Not: Birkaç haftalık veri küçük bir örneklem. Sonuçlar kesin değil, yön gösterir. "
-                 "En az 30–50 işlem olmadan karar verme.")
-    tg_send("\n\n".join(parts))
+            for name, n_set, tr in per:
+                out.append(f"   {name}: {line(tr, n_set)}")
+    out.append("R = risk ettiğin miktar. +1R = riski kadar kazanç. Az işlemle sonuç kesin değil.")
+    tg_send("\n".join(out))
 
 
 def main():
@@ -1350,7 +1302,7 @@ def main():
         if HOURLY_STATUS and now_tr.hour in HOURLY_HOURS_TR:
             if state.get("last_hourly") != hour_key:
                 first = state["last_brief"] != today
-                do_brief(results, title="Günaydın, günün durumu" if first else f"Saatlik durum {now_tr:%H}:00")
+                do_brief(results, title="Günaydın, günün durumu" if first else "Saatlik durum")
                 state["last_hourly"] = hour_key
                 state["last_brief"] = today
         elif now_tr.hour >= DAILY_BRIEF_TR_HOUR and state["last_brief"] != today:
