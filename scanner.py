@@ -64,9 +64,13 @@ SETTINGS = {
     "htf_piv_len": 3,         # 4s salınım uzunluğu
     "watch_bars": 32,         # bölgeye dokunduktan sonra teyit bekleme (15dk mum, 32 = 8 saat)
     "arm_bars": 16,           # kurulumdan sonra girişe gelme bekleme (16 = 4 saat)
-    "trade_bars": 192,        # açık işlemi en fazla izleme süresi (192 = 2 gün)
+    "trade_bars": 960,        # açık işlemi en fazla izleme süresi (960 = 10 gün; geniş stoplu işlemler uzun sürebilir)
     "buf_mult": 0.5,          # stop tamponu = 15dk ATR x bu
     "min_rr": 2.0,            # karşı bölgeye en az R:R
+    "stop_mode": "structure", # tight = iğnenin altı, zone = bölgenin dışı, structure = solda koruyan dip/tepenin ötesi
+    "struct_lookback": 96,    # yapısal stop için geriye bakılan mum sayısı (96 = 24 saat)
+    "struct_buf_mult": 1.0,   # yapısal stop tamponu = 15dk ATR x bu
+    "max_stop_atr": 20,       # stop bundan uzaksa (ATR cinsinden) daha yakın yapısal seviyeye geç
     "use_htf": True,          # günlük/haftalık FVG ve 4s'te 3+ test edilen seviyelerden fırsat
     "h4_touches": 3,          # 4 saatlikte kaç kez test edilen seviye önemli sayılsın
     "poi_watch_bars": 48,
@@ -87,8 +91,8 @@ VARIANTS = {
                             "killzones": [("02:00", "05:00", "Londra"), ("09:30", "11:00", "NY AM")]},
     "Sadece bölgeden dönüş": {"use_retest": False},
     "Sadece seans saatleri": {"use_killzone": True},
-    "Geniş stop (1,5 ATR tampon)": {"buf_mult": 1.5},
-    "Çok geniş stop (3 ATR tampon)": {"buf_mult": 3.0},
+    "Stop: kısa (iğnenin hemen ötesi)": {"stop_mode": "tight"},
+    "Stop: bölgenin dışı": {"stop_mode": "zone"},
     "Gevşek": {"mss_mult": 0.4, "disp_mult": 0.8, "min_rr": 1.5},
 }
  
@@ -412,8 +416,32 @@ def run_side(df: pd.DataFrame, s: dict, use_kz: bool, bias: np.ndarray, d1=None,
         tops = [z.bot for z in opp if z.bot > entry]
         return min(tops) if tops else None
  
+    def choose_stop(i, e, tight, zone_bot):
+        """Stop yeri. tight = iğnenin hemen altı; zone = bölgenin dışı;
+        structure = solda fiyatı koruyan son dibin altı (yapısal)."""
+        a = A[i] if not np.isnan(A[i]) else 0.0
+        mode = s.get("stop_mode", "structure")
+        if mode == "tight" or a == 0:
+            return tight, "tight"
+        cands = [(tight, "tight")]
+        if zone_bot is not None:
+            cands.append((zone_bot - s["buf_mult"] * a, "zone"))
+        if mode == "structure":
+            lb = s.get("struct_lookback", 96)
+            lo = L[max(0, i - lb):i + 1].min()
+            cands.append((lo - s.get("struct_buf_mult", 1.0) * a, "structure"))
+        st, kind = min(cands, key=lambda c: c[0])
+        if e - st > s.get("max_stop_atr", 20) * a:          # çok uzaksa bir öncekine dön
+            ok = [c for c in cands if e - c[0] <= s.get("max_stop_atr", 20) * a]
+            st, kind = min(ok, key=lambda c: c[0]) if ok else (tight, "tight")
+        return st, kind
+ 
     def make_setup(i, e, st, extra):
-        """Ortak kurulum: karşı bölge kontrolü + kalite. None = yer yok."""
+        """Ortak kurulum: stop seçimi + karşı bölge kontrolü + kalite. None = yer yok."""
+        zb = extra.get("zbot")
+        if zb is None and extra.get("lvl") is not None:
+            zb = extra["lvl"]
+        st, extra["stop_kind"] = choose_stop(i, e, st, zb)
         r = e - st
         if r <= 0:
             return None, None
@@ -1358,6 +1386,12 @@ def msg_setup(name, cfg, ev):
         quality = (f"Kalite {ev['grade']} ({ev['score']}/4): {'likidite alındı' if ev['swept'] else 'likidite alınmadı'} · "
                    f"{ev['test_no']}. test · FVG {'var' if ev['fvg'] else 'yok'} · {room_txt}")
         title = f"<b>{name} | {w['side']} FIRSATI (bölgeden dönüş) — Kalite {ev['grade']}</b>"
+    sk = ev.get("stop_kind")
+    if sk == "structure":
+        stop_why = ("solda fiyatı koruyan son dibin altı (yapısal stop)" if up
+                    else "solda fiyatı koruyan son tepenin üstü (yapısal stop)")
+    elif sk == "zone":
+        stop_why = f"bölgenin {'altı' if up else 'üstü'}"
     lines = [title, f"Mum: {tr_time(ev['time'])} (TR, 15dk)", "", "<b>Neden:</b>"] + why + [
         "",
         "<b>Plan:</b>",
@@ -1662,6 +1696,7 @@ def do_report(results):
     review_trades(results)
  
  
+STOP_NAMES = {"tight": "iğnenin ötesi", "zone": "bölgenin dışı", "structure": "yapısal: solda koruyan dip/tepe"}
 SETUP_NAMES = {"HTF": "günlük/haftalık bölge", "ZONE": "1s bölgeden dönüş", "RETEST": "kırılım + geri test"}
  
  
@@ -1698,7 +1733,7 @@ def msg_review(name, cfg, tr):
         res = "Sonuç: TP1 ve TP2 geldi. Toplam <b>+2,5R</b>."
     return (f"<b>{name} | {w['side']} — {tr_time(ev['time'])} · Kalite {tr.get('grade', '')} · "
             f"{SETUP_NAMES.get(ev.get('setup'), '')}</b>\n"
-            f"Giriş {fmt(tr['entry'], d)} · Stop {fmt(tr['stop'], d)} · TP1 {fmt(tr['tp1'], d)}\n"
+            f"Giriş {fmt(tr['entry'], d)} · Stop {fmt(tr['stop'], d)} ({STOP_NAMES.get(ev.get('stop_kind'), '')}) · TP1 {fmt(tr['tp1'], d)}\n"
             f"Neden aldı: {why}\n{res}")
  
  
