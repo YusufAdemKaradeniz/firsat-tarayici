@@ -64,13 +64,13 @@ SETTINGS = {
     "htf_piv_len": 3,         # 4s salınım uzunluğu
     "watch_bars": 32,         # bölgeye dokunduktan sonra teyit bekleme (15dk mum, 32 = 8 saat)
     "arm_bars": 16,           # kurulumdan sonra girişe gelme bekleme (16 = 4 saat)
-    "trade_bars": 960,        # açık işlemi en fazla izleme süresi (960 = 10 gün; geniş stoplu işlemler uzun sürebilir)
+    "trade_bars": 36,         # işlem en fazla 9 saat açık kalır (36 x 15dk); süre dolunca kapatılır
     "buf_mult": 0.5,          # stop tamponu = 15dk ATR x bu
     "min_rr": 2.0,            # karşı bölgeye en az R:R
     "stop_mode": "structure", # tight = iğnenin altı, zone = bölgenin dışı, structure = solda koruyan dip/tepenin ötesi
-    "struct_lookback": 96,    # yapısal stop için geriye bakılan mum sayısı (96 = 24 saat)
+    "struct_lookback": 32,    # yapısal stop: son 8 saatte fiyatı koruyan dip/tepe (kısa vadeli işleme uygun)
     "struct_buf_mult": 1.0,   # yapısal stop tamponu = 15dk ATR x bu
-    "max_stop_atr": 20,       # stop bundan uzaksa (ATR cinsinden) daha yakın yapısal seviyeye geç
+    "max_stop_atr": 8,       # stop bundan uzaksa (ATR cinsinden) daha yakın yapısal seviyeye geç
     "use_htf": True,          # günlük/haftalık FVG ve 4s'te 3+ test edilen seviyelerden fırsat
     "h4_touches": 3,          # 4 saatlikte kaç kez test edilen seviye önemli sayılsın
     "poi_watch_bars": 48,
@@ -240,14 +240,18 @@ def in_killzone(ts: pd.Timestamp, s: dict) -> bool:
     return False
  
  
-def _eval_rr(H, L, i0, entry, stop, rr, max_bars):
-    """Sabit hedefli sonuç (alış koordinatında). Aynı mumda stop+hedef = stop."""
+def _eval_rr(H, L, i0, entry, stop, rr, max_bars, C=None):
+    """Sabit hedefli sonuç (alış koordinatında). Aynı mumda stop+hedef = stop.
+    Süre dolarsa o anki fiyattan kapatılmış sayılır."""
     tp = entry + rr * (entry - stop)
-    for j in range(i0, min(len(H), i0 + max_bars)):
+    end = min(len(H), i0 + max_bars + 1)
+    for j in range(i0, end):
         if L[j] <= stop:
             return -1.0
         if j > i0 and H[j] >= tp:
             return rr
+    if C is not None and end - 1 >= i0 + max_bars:
+        return float((C[end - 1] - entry) / (entry - stop))
     return None
  
  
@@ -726,11 +730,16 @@ def run_side(df: pd.DataFrame, s: dict, use_kz: bool, bias: np.ndarray, d1=None,
                     events.append(dict(kind="TP2", i=i, time=ti, setup_time=tr["setup_time"], tp2=tr["tp2"], result=2.5))
                     open_trades.remove(tr)
                     continue
-            if i - tr["i"] > s["trade_bars"]:
+            if i - tr["i"] >= s["trade_bars"]:
+                now_r = (C[i] - tr["entry"]) / tr["risk"]
+                res = (0.5 * 2.0 + 0.5 * now_r) if tr["tp1_hit"] else now_r
+                tr["managed"] = float(res)
+                events.append(dict(kind="TIMEOUT", i=i, time=ti, setup_time=tr["setup_time"], entry=tr["entry"],
+                                   result=float(res), hours=s["trade_bars"] * 15 // 60))
                 open_trades.remove(tr)
  
     for tr in trades:
-        tr["r1"] = _eval_rr(H, L, tr["i"], tr["entry"], tr["stop"], 1.0, s["trade_bars"])
+        tr["r1"] = _eval_rr(H, L, tr["i"], tr["entry"], tr["stop"], 1.0, s["trade_bars"], C)
         # işlem incelemesi: stoptan önce lehimize en fazla kaç R gitti, stop 1,5 kat olsaydı ne olurdu
         e0, r0 = tr["entry"], tr["risk"]
         mfe, end_j = 0.0, None
@@ -743,8 +752,8 @@ def run_side(df: pd.DataFrame, s: dict, use_kz: bool, bias: np.ndarray, d1=None,
         tr["mfe"] = mfe
         tr["end_i"] = end_j
         tr["wide"] = _eval_rr(H, L, tr["i"], e0, e0 - 1.5 * r0, 2.0 / 1.5, s["trade_bars"])
-        tr["r2"] = _eval_rr(H, L, tr["i"], tr["entry"], tr["stop"], 2.0, s["trade_bars"])
-        tr["r3"] = _eval_rr(H, L, tr["i"], tr["entry"], tr["stop"], 3.0, s["trade_bars"])
+        tr["r2"] = _eval_rr(H, L, tr["i"], tr["entry"], tr["stop"], 2.0, s["trade_bars"], C)
+        tr["r3"] = _eval_rr(H, L, tr["i"], tr["entry"], tr["stop"], 3.0, s["trade_bars"], C)
  
     # son durumdaki seviyeler (saatlik özet için)
     lv_state = [dict(lvl=lv["lvl"], name=lv["name"], state=lv["state"]) for lv in levels]
@@ -1455,7 +1464,14 @@ def msg_stop(name, cfg, ev):
             f"Kurallara uyduysan bu normal bir kayıp. Sıradaki fırsata.")
  
  
-MESSAGES = {"POI": msg_poi, "POI_NOENTRY": msg_poi_noentry, "WATCH": msg_watch, "UNWATCH": msg_unwatch, "BREAK": msg_break, "RFAIL": msg_rfail,
+def msg_timeout(name, cfg, ev):
+    w = W_(ev["dir"])
+    r = ev["result"]
+    return (f"<b>{name} | {w['side']} — {ev['hours']} saat doldu, işlemi kapat</b>\n"
+            f"İşlem hedefe ya da stopa gitmedi. Şu anki fiyattan sonuç: <b>{r:+.1f}R</b>.")
+ 
+ 
+MESSAGES = {"TIMEOUT": msg_timeout, "POI": msg_poi, "POI_NOENTRY": msg_poi_noentry, "WATCH": msg_watch, "UNWATCH": msg_unwatch, "BREAK": msg_break, "RFAIL": msg_rfail,
             "SETUP": msg_setup, "ENTRY": msg_entry,
             "CANCEL": msg_cancel, "TP1": msg_tp1, "TP2": msg_tp2, "BE": msg_be, "STOP": msg_stop}
  
@@ -1568,7 +1584,7 @@ def _enabled(kind):
         return SEND_GIVEUP_ALERTS
     if kind == "CANCEL":
         return SEND_CANCEL_ALERTS
-    if kind in ("TP1", "TP2", "BE", "STOP"):
+    if kind in ("TP1", "TP2", "BE", "STOP", "TIMEOUT"):
         return SEND_RESULT_ALERTS
     return True
  
@@ -1590,7 +1606,7 @@ def do_scan(state, results):
                 continue
             if ev["kind"] == "SETUP" and ev.get("grade", "A") > SEND_MIN_GRADE:
                 continue
-            if ev["kind"] in ("ENTRY", "CANCEL", "TP1", "TP2", "BE", "STOP"):
+            if ev["kind"] in ("ENTRY", "CANCEL", "TP1", "TP2", "BE", "STOP", "TIMEOUT"):
                 skey = f"{name}|SETUP|{ev['dir']}|{ev['setup_time'].isoformat()}"
                 if skey not in state["sent"]:
                     continue   # fırsat mesajı gitmediyse takip mesajları da gitmez
@@ -1719,6 +1735,8 @@ def msg_review(name, cfg, tr):
     m = tr.get("managed")
     if m is None:
         res = "Sonuç: işlem hâlâ açık ya da süre doldu."
+    elif tr.get("end_i") is None and m not in (1.0, 2.5):
+        res = f"Sonuç: 9 saat doldu, işlem kapatıldı. Toplam <b>{m:+.1f}R</b>."
     elif m < 0:
         res = (f"Sonuç: <b>STOP (−1R)</b>. Stoptan önce fiyat en fazla +{tr.get('mfe', 0):.1f}R lehimize gitti. ")
         if tr.get("mfe", 0) >= 1.0:
