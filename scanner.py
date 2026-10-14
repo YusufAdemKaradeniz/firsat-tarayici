@@ -9,12 +9,12 @@ Strateji:
   4) Teyit    : 15 dakikalıkta yapı kırılımı (MSS). Likidite süpürmesi kaliteyi artırır.
   5) Giriş    : FVG'ye / MSS mumuna geri çekilmede limit, karşı bölgeye en az 1:2 yer
   +) Kırılım + geri test: Asya / Londra / New York / dünkü tepe-dip kırılıp geri test edilince fırsat
-
+ 
 Mesajlar:
   İZLEMEDE   : fiyat bölgeye geldi, ne beklendiği ve neyin iptal ettireceği
   KURULUM    : tüm kapılar açıldı, nedenleri + giriş/stop/hedef planı + kalite notu
   GİRİŞ / TP1 / TP2 / STOP / İPTAL : işlemin takibi
-
+ 
 Modlar (MODE ortam değişkeni ya da ilk argüman):
   scan  : normal tarama (GitHub her 5 dakikada bunu çalıştırır)
   test  : Telegram'a test mesajı + anlık durum
@@ -32,10 +32,10 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from zoneinfo import ZoneInfo
-
+ 
 import numpy as np
 import pandas as pd
-
+ 
 # =====================================================================
 # AYARLAR — değiştirmek istersen sadece bu bölümü düzenle
 # =====================================================================
@@ -47,7 +47,7 @@ SYMBOLS = {
     "US100":  {"ticker": "NQ=F",     "digits": 2, "pip": 1.0,    "unit": "puan"},  # Nasdaq 100 vadeli
     "BTCUSD": {"ticker": "BTC-USD",  "digits": 2, "pip": 1.0,    "unit": "$"},
 }
-
+ 
 SETTINGS = {
     "bias_tf": "4h",          # yön zaman dilimi
     "zone_tf": "1h",          # bölge zaman dilimi
@@ -67,6 +67,10 @@ SETTINGS = {
     "trade_bars": 192,        # açık işlemi en fazla izleme süresi (192 = 2 gün)
     "buf_mult": 0.5,          # stop tamponu = 15dk ATR x bu
     "min_rr": 2.0,            # karşı bölgeye en az R:R
+    "use_htf": True,          # günlük/haftalık FVG ve 4s'te 3+ test edilen seviyelerden fırsat
+    "h4_touches": 3,          # 4 saatlikte kaç kez test edilen seviye önemli sayılsın
+    "poi_watch_bars": 48,
+    "htf_trend_filter": True, # günlük trend tersse büyük bölgeden işlem arama     # büyük bölgede 15dk onay bekleme (48 = 12 saat)
     "use_retest": True,       # seans tepe/diplerinde kırılım + geri test fırsatları
     "retest_bars": 32,        # kırılımdan sonra geri test bekleme (32 = 8 saat)
     "retest_levels": ("Londra", "New York", "Dünkü"),  # takip edilen seans seviyeleri
@@ -74,7 +78,7 @@ SETTINGS = {
     "away_mult": 1.0,         # geri testten önce seviyeden en az ATR x bu uzaklaşmalı
     "fail_mult": 1.5,         # seviyenin ATR x bu kadar ötesinde kapanış = kırılım başarısız
 }
-
+ 
 # Rapor modunda karşılaştırılacak ayar setleri
 VARIANTS = {
     "Dengeli (aktif)": {},
@@ -85,43 +89,46 @@ VARIANTS = {
     "Sadece seans saatleri": {"use_killzone": True},
     "Gevşek": {"mss_mult": 0.4, "disp_mult": 0.8, "min_rr": 1.5},
 }
-
+ 
 SEND_WATCH_ALERTS = True      # "İZLEMEDE" açıklama mesajları
 SEND_CHARTS = True            # İZLEMEDE ve KURULUM mesajlarıyla birlikte grafik resmi gönder
 WATCH_ONLY_IN_KILLZONE = False # izleme mesajı sadece seans saatlerinde gelsin (gece rahatsız etmez)
 SEND_CANCEL_ALERTS = True     # açık fırsat iptal olunca haber ver (bekleyen emrini silmen için)
+SEND_SMALL_WATCH_ALERTS = False  # 1s bölge / seans tepesi "takipte" mesajları (2 saatlik durum zaten anlatıyor)
+SEND_MIN_GRADE = "B"          # bu kaliteden düşük fırsatlar gönderilmez (A, B ya da C)
 SEND_GIVEUP_ALERTS = False    # "fikrinden vazgeçtim" mesajları (saatlik durum zaten anlatıyor)
 SEND_RESULT_ALERTS = True     # TP1 / TP2 / stop mesajları
 ALERT_LOOKBACK_HOURS = 3      # son kaç saatteki olaylar bildirilsin (gecikmelere karşı)
 DAILY_BRIEF_TR_HOUR = 8       # günlük özet saati (Türkiye saati)
-HOURLY_STATUS = True          # her saat başı sade dille durum mesajı
+HOURLY_STATUS = True          # düzenli durum mesajı
+STATUS_EVERY_HOURS = 2        # kaç saatte bir durum mesajı gelsin
 HOURLY_HOURS_TR = range(0, 24)  # saatlik mesajların geleceği saatler (Türkiye saati). 0-24 = 7/24
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.json")
-
+ 
 NY = ZoneInfo("America/New_York")
 TR = ZoneInfo("Europe/Istanbul")
 BAR = pd.Timedelta("15min")
-
-
+ 
+ 
 # =====================================================================
 # Yardımcılar
 # =====================================================================
 def rma(s: pd.Series, n: int) -> pd.Series:
     return s.ewm(alpha=1.0 / n, adjust=False).mean()
-
-
+ 
+ 
 def atr(df: pd.DataFrame, n: int = 14) -> pd.Series:
     pc = df["close"].shift(1)
     tr = pd.concat([df["high"] - df["low"], (df["high"] - pc).abs(), (df["low"] - pc).abs()], axis=1).max(axis=1)
     return rma(tr, n)
-
-
+ 
+ 
 def resample(df: pd.DataFrame, rule: str) -> pd.DataFrame:
     out = df.resample(rule, label="left", closed="left").agg(
         {"open": "first", "high": "max", "low": "min", "close": "last"})
     return out.dropna()
-
-
+ 
+ 
 def pivots(high: np.ndarray, low: np.ndarray, p: int):
     """Onaylanmış salınımlar: ph[i] = (i-p)'deki tepe, i'de onaylanır. Yoksa nan."""
     n = len(high)
@@ -136,29 +143,29 @@ def pivots(high: np.ndarray, low: np.ndarray, p: int):
         if low[c] == wl.min() and (wl == low[c]).sum() == 1:
             pl[i] = low[c]
     return ph, pl
-
-
+ 
+ 
 def fmt(x: float, digits: int) -> str:
     return f"{x:,.{digits}f}"
-
-
+ 
+ 
 def tr_time(ts: pd.Timestamp) -> str:
     return ts.tz_convert(TR).strftime("%d.%m %H:%M")
-
-
+ 
+ 
 def mirror(df: pd.DataFrame) -> pd.DataFrame:
     """Satış tarafını alış mantığıyla hesaplamak için fiyatı ters çevirir."""
     return pd.DataFrame({"open": -df["open"], "high": -df["low"], "low": -df["high"], "close": -df["close"]},
                         index=df.index)
-
-
+ 
+ 
 # =====================================================================
 # Strateji motoru
 # =====================================================================
 # Motor her zaman "alış" mantığıyla yazıldı. Satış tarafı, fiyat ters çevrilerek
 # (mirror) aynı kodla hesaplanır; sonuçlar tekrar çevrilir. Böylece iki taraf
 # birebir aynı kurallarla çalışır ve kod tekrarı olmaz.
-
+ 
 @dataclass
 class Zone:
     top: float
@@ -166,11 +173,12 @@ class Zone:
     born: pd.Timestamp
     tests: int = 0
     used: bool = False
-
-
+ 
+ 
 PRICE_FIELDS = ("ztop", "zbot", "ref_h", "ref_l", "invalid", "entry", "stop", "tp1", "tp2", "opp", "lvl", "rlow")
-
-
+# dtrend / wtrend yön değerleri ters tarafta zaten çevrilmiş geliyor (alış koordinatı: 1 = uyumlu)
+ 
+ 
 def bias_by_bar(df15: pd.DataFrame, s: dict) -> np.ndarray:
     h4 = resample(df15, s["bias_tf"])
     H, L, C = h4["high"].values, h4["low"].values, h4["close"].values
@@ -192,8 +200,8 @@ def bias_by_bar(df15: pd.DataFrame, s: dict) -> np.ndarray:
     left = pd.DataFrame({"t": df15.index.as_unit("ns")})
     m = pd.merge_asof(left, ends, on="t", direction="backward")
     return m["bias"].fillna(0).astype(int).values
-
-
+ 
+ 
 def zone_events(df15: pd.DataFrame, s: dict):
     """1s talep (alış tarafı) bölgeleri ve karşı taraf (arz) bölgeleri."""
     h1 = resample(df15, s["zone_tf"])
@@ -212,8 +220,8 @@ def zone_events(df15: pd.DataFrame, s: dict):
         if C[i] < O[i] and (O[i] - C[i]) >= s["disp_mult"] * a[i] and C[i] < L[i - 1]:
             ev.append((end, "opp", max(H[i - 1], H[i]), min(O[i - 1], C[i - 1])))
     return ev
-
-
+ 
+ 
 def in_killzone(ts: pd.Timestamp, s: dict) -> bool:
     t = ts.tz_convert(NY)
     hm = t.hour * 60 + t.minute
@@ -223,8 +231,8 @@ def in_killzone(ts: pd.Timestamp, s: dict) -> bool:
         if ha * 60 + ma <= hm < hb * 60 + mb:
             return True
     return False
-
-
+ 
+ 
 def _eval_rr(H, L, i0, entry, stop, rr, max_bars):
     """Sabit hedefli sonuç (alış koordinatında). Aynı mumda stop+hedef = stop."""
     tp = entry + rr * (entry - stop)
@@ -234,11 +242,11 @@ def _eval_rr(H, L, i0, entry, stop, rr, max_bars):
         if j > i0 and H[j] >= tp:
             return rr
     return None
-
-
+ 
+ 
 SESSIONS = [("Asya", "20:00", "24:00"), ("Londra", "02:00", "05:00"), ("New York", "09:30", "11:00")]
-
-
+ 
+ 
 def session_levels(df: pd.DataFrame):
     """Seans tepeleri (alış koordinatında) ve dünkü tepe. [(bitiş zamanı, seviye, ad)]"""
     ny = df.index.tz_convert(NY)
@@ -269,9 +277,97 @@ def session_levels(df: pd.DataFrame):
         out.append((last_idx[d0] + BAR, float(day.loc[d0, "max"]), "Dünkü"))
     out.sort(key=lambda r: r[0])
     return out
-
-
-def run_side(df: pd.DataFrame, s: dict, use_kz: bool, bias: np.ndarray):
+ 
+ 
+ 
+# =====================================================================
+# Büyük zaman dilimi (günlük / haftalık / 4 saatlik) bağlamı
+# =====================================================================
+DAY = pd.Timedelta("1D")
+WEEK = pd.Timedelta("7D")
+H4 = pd.Timedelta("4h")
+ 
+ 
+def weekly_from_daily(d1: pd.DataFrame) -> pd.DataFrame:
+    w = d1.resample("W-MON", label="left", closed="left").agg(
+        {"open": "first", "high": "max", "low": "min", "close": "last"}).dropna()
+    return w
+ 
+ 
+def structure(dfx: pd.DataFrame, p: int = 2):
+    """Her mum için yapı yönü (1 yukarı, -1 aşağı, 0 belirsiz) + son tepe/dip notu."""
+    H, L, C = dfx["high"].values, dfx["low"].values, dfx["close"].values
+    ph, pl = pivots(H, L, p)
+    st, hs, ls = 0, [], []
+    out = np.zeros(len(dfx), dtype=int)
+    for i in range(len(dfx)):
+        if not np.isnan(ph[i]):
+            hs.append(ph[i])
+        if not np.isnan(pl[i]):
+            ls.append(pl[i])
+        if hs and C[i] > hs[-1]:
+            st = 1
+        elif ls and C[i] < ls[-1]:
+            st = -1
+        elif len(hs) >= 2 and len(ls) >= 2 and st == 0:
+            st = 1 if (hs[-1] > hs[-2] and ls[-1] > ls[-2]) else (-1 if (hs[-1] < hs[-2] and ls[-1] < ls[-2]) else 0)
+        out[i] = st
+    note = ""
+    last = out[-1] if len(out) else 0
+    if last <= 0 and len(hs) >= 2 and hs[-1] < hs[-2]:
+        note = "son tepe öncekini geçemedi"
+    elif last >= 0 and len(ls) >= 2 and ls[-1] > ls[-2]:
+        note = "son dip öncekinden yüksek"
+    return out, note
+ 
+ 
+def htf_by_bar(dfx: pd.DataFrame, period: pd.Timedelta, df15: pd.DataFrame) -> np.ndarray:
+    """Büyük zaman dilimi yönünü 15dk mumlara taşır (sadece kapanmış mumlar)."""
+    st, _ = structure(dfx)
+    ends = pd.DataFrame({"t": (dfx.index + period).as_unit("ns"), "v": st})
+    left = pd.DataFrame({"t": df15.index.as_unit("ns")})
+    m = pd.merge_asof(left, ends.sort_values("t"), on="t", direction="backward")
+    return m["v"].fillna(0).astype(int).values
+ 
+ 
+def fvg_pois(dfx: pd.DataFrame, period: pd.Timedelta, kind: str):
+    """Yükseliş FVG'leri (alış koordinatında destek): [(müsait olduğu an, alt, üst, tür)]"""
+    H, L = dfx["high"].values, dfx["low"].values
+    a = atr(dfx).values
+    out = []
+    for k in range(2, len(dfx)):
+        if L[k] > H[k - 2] and not np.isnan(a[k]) and (L[k] - H[k - 2]) >= 0.25 * a[k] and len(dfx) - k <= 120:
+            out.append((dfx.index[k] + period, float(H[k - 2]), float(L[k]), kind))
+    return out
+ 
+ 
+def cluster_pois(h4: pd.DataFrame, min_touch: int = 3):
+    """4 saatlikte 3+ kez test edilen dip seviyeleri (alış koordinatında destek)."""
+    H, L = h4["high"].values, h4["low"].values
+    a = atr(h4).values
+    ph, pl = pivots(H, L, 2)
+    clusters, out = [], []
+    for k in range(len(h4)):
+        if np.isnan(pl[k]) or np.isnan(a[k]):
+            continue
+        v, tol = pl[k], 0.4 * a[k]
+        for c in clusters:
+            if abs(np.mean(c["v"]) - v) <= tol:
+                c["v"].append(v)
+                c["t"].append(h4.index[k])
+                if len(c["v"]) == min_touch and (c["t"][-1] - c["t"][0]) >= pd.Timedelta("1D"):
+                    out.append((h4.index[k] + H4, float(min(c["v"]) - 0.1 * a[k]),
+                                float(max(c["v"]) + 0.1 * a[k]), "H4"))
+                break
+        else:
+            clusters.append(dict(v=[v], t=[h4.index[k]]))
+    return out
+ 
+ 
+POI_NAMES = {"D1": "günlük FVG", "W1": "haftalık FVG", "H4": "4 saatlikte 3+ kez test edilen seviye"}
+ 
+ 
+def run_side(df: pd.DataFrame, s: dict, use_kz: bool, bias: np.ndarray, d1=None, dbias=None, wbias=None):
     """Tek taraf (alış koordinatında). Olaylar, işlemler ve son durumu döndürür."""
     n = len(df)
     t = df.index
@@ -282,23 +378,37 @@ def run_side(df: pd.DataFrame, s: dict, use_kz: bool, bias: np.ndarray):
     zev = zone_events(df, s)
     lev = session_levels(df) if s.get("use_retest", True) else []
     zi = li = 0
-
+ 
     own, opp = [], []
     last_ph = last_pl = np.nan
     events, trades, open_trades, armed = [], [], [], []
     pl_list = []          # (dip değeri, dibin oluştuğu mum)
     levels = []           # seans seviyeleri: dict(lvl, name, born, state, ...)
     W = dict(state=0)
-
+    # Büyük zaman dilimi bölgeleri (günlük/haftalık FVG, 4s'te 3+ test)
+    pev = []
+    if s.get("use_htf", True):
+        if d1 is not None and len(d1) > 5:
+            pev += fvg_pois(d1, DAY, "D1")
+            pev += fvg_pois(weekly_from_daily(d1), WEEK, "W1")
+        pev += cluster_pois(resample(df, "4h"), s.get("h4_touches", 3))
+        pev.sort(key=lambda r: r[0])
+    pi = 0
+    pois = []
+    if dbias is None:
+        dbias = np.zeros(n, dtype=int)
+    if wbias is None:
+        wbias = np.zeros(n, dtype=int)
+ 
     def push(arr, z):
         arr.append(z)
         while len(arr) > s["max_zones"]:
             arr.pop(0)
-
+ 
     def nearest_opp(entry):
         tops = [z.bot for z in opp if z.bot > entry]
         return min(tops) if tops else None
-
+ 
     def make_setup(i, e, st, extra):
         """Ortak kurulum: karşı bölge kontrolü + kalite. None = yer yok."""
         r = e - st
@@ -311,7 +421,7 @@ def run_side(df: pd.DataFrame, s: dict, use_kz: bool, bias: np.ndarray):
         ev = dict(kind="SETUP", i=i, time=t[i], entry=e, stop=st, risk=r, tp1=e + 2 * r, tp2=e + 3 * r,
                   room=room, opp=o, **extra)
         return ev, room
-
+ 
     for i in range(2, n):
         ti = t[i]
         a_i = A[i] if not np.isnan(A[i]) else 0.0
@@ -319,7 +429,11 @@ def run_side(df: pd.DataFrame, s: dict, use_kz: bool, bias: np.ndarray):
         kz_ok = (not use_kz) or in_killzone(ti, s)
         bias_ok = (not s["use_bias"]) or bias[i] == 1
         not_against = (not s["use_bias"]) or bias[i] != -1
-
+        # günlük trend tersse hiçbir kurulum aranmaz (büyük resim önce gelir)
+        htf_ok_i = (not s.get("htf_trend_filter", True)) or dbias[i] != -1
+        bias_ok = bias_ok and htf_ok_i
+        not_against = not_against and htf_ok_i
+ 
         # 1) Yeni 1s bölgeler ve seans seviyeleri (sadece kapanmış olanlar)
         while zi < len(zev) and zev[zi][0] <= ti:
             end, kind, top, bot = zev[zi]
@@ -330,7 +444,7 @@ def run_side(df: pd.DataFrame, s: dict, use_kz: bool, bias: np.ndarray):
             if C[i - 1] < lvl and name in s.get("retest_levels", ("Londra", "New York", "Dünkü")):
                 levels.append(dict(lvl=lvl, name=name, born=end, state="fresh"))
             li += 1
-
+ 
         # 2) 15dk salınımlar
         if not np.isnan(ph[i]):
             last_ph = ph[i]
@@ -341,7 +455,7 @@ def run_side(df: pd.DataFrame, s: dict, use_kz: bool, bias: np.ndarray):
             pl_list.append((pl[i], i - p))
             if len(pl_list) > 200:
                 pl_list.pop(0)
-
+ 
         # 3) Bölgeler: geçersiz kılma + test sayımı
         for z in list(opp):
             if C[i] > z.top:
@@ -360,7 +474,7 @@ def run_side(df: pd.DataFrame, s: dict, use_kz: bool, bias: np.ndarray):
                     events.append(dict(kind="WATCH", i=i, time=ti, ztop=z.top, zbot=z.bot, born=z.born,
                                        test_no=z.tests, ref_h=last_ph, ref_l=liq,
                                        invalid=z.bot - buf, kz_now=in_killzone(ti, s)))
-
+ 
         # 4) Bölge akışı: tepki + kırılım bekleniyor
         if W["state"] == 1:
             z = W["zone"]
@@ -403,7 +517,7 @@ def run_side(df: pd.DataFrame, s: dict, use_kz: bool, bias: np.ndarray):
                         events.append(ev)
                         armed.append(dict(ev=ev, arm=i))
                     W = dict(state=0)
-
+ 
         # 5) Kırılım + geri test akışı (seans tepeleri)
         for lv in list(levels):
             if ti - lv["born"] > pd.Timedelta("30h") and lv["state"] == "fresh":
@@ -465,69 +579,137 @@ def run_side(df: pd.DataFrame, s: dict, use_kz: bool, bias: np.ndarray):
                 ev["score"] = score
                 events.append(ev)
                 armed.append(dict(ev=ev, arm=i))
-
+ 
+        # 6b) Büyük zaman dilimi bölgesi: günlük/haftalık FVG ya da 4s'te çok test edilen seviye
+        while pi < len(pev) and pev[pi][0] <= ti:
+            av, bot, top, kind = pev[pi]
+            if C[i - 1] > top and not any(q["bot"] <= top and bot <= q["top"] for q in pois):
+                pois.append(dict(bot=bot, top=top, kind=kind, born=av, touches=0, inside=False))
+            pi += 1
+        for q in list(pois):
+            if C[i] < q["bot"] - max(1.0 * a_i, 0.3 * (q["top"] - q["bot"])):   # bölge kırıldı
+                if q["inside"] and q.get("active", True) and q.get("last_ann") == q.get("wt"):
+                    events.append(dict(kind="POI_NOENTRY", i=i, time=ti, ztop=q["top"], zbot=q["bot"], poi=q["kind"],
+                                       watch_time=q["wt"], reason="bölge kırıldı, fikir bozuldu."))
+                pois.remove(q)
+                continue
+            if not q["inside"]:
+                if L[i] <= q["top"]:
+                    q.update(inside=True, start=i, wt=ti, sweep=L[i], ref_h=last_ph)
+                    q["touches"] += 1
+                    htf_ok = (not s.get("htf_trend_filter", True)) or dbias[i] != -1
+                    q["active"] = htf_ok
+                    if not htf_ok:
+                        continue
+                    # aynı bölgeye kısa sürede tekrar gelirse yeniden mesaj atma
+                    if q.get("last_ann") is not None and (ti - q["last_ann"]) < pd.Timedelta("12h"):
+                        continue
+                    q["last_ann"] = ti
+                    events.append(dict(kind="POI", i=i, time=ti, ztop=q["top"], zbot=q["bot"], poi=q["kind"],
+                                       touches=q["touches"], dtrend=int(dbias[i]), wtrend=int(wbias[i]),
+                                       ref_h=last_ph, kz_now=True))
+                continue
+            q["sweep"] = min(q["sweep"], L[i])
+            if not q.get("active", True):
+                if L[i] > q["top"] + 2 * a_i or i - q["start"] > s.get("poi_watch_bars", 48):
+                    q["inside"] = False
+                continue
+            if not np.isnan(ph[i]) and (i - p) >= q["start"]:
+                q["ref_h"] = ph[i]                               # bölgedeki ilk tepkinin tepesi
+            mss = (not np.isnan(q["ref_h"])) and C[i] > q["ref_h"] and (C[i] - O[i]) >= s["mss_mult"] * a_i
+            if mss and not armed:
+                fvg = L[i] > H[i - 2]
+                e = L[i] if fvg else (O[i] + C[i]) / 2
+                ev, room = make_setup(i, e, q["sweep"] - buf, dict(
+                    setup="HTF", poi=q["kind"], ztop=q["top"], zbot=q["bot"], touches=q["touches"],
+                    ref_h=q["ref_h"], fvg=fvg, swept=False, dtrend=int(dbias[i]), wtrend=int(wbias[i])))
+                q["inside"] = False
+                if ev is None:
+                    if room is not None:
+                        events.append(dict(kind="POI_NOENTRY", i=i, time=ti, ztop=q["top"], zbot=q["bot"],
+                                           poi=q["kind"], watch_time=q["wt"],
+                                           reason=f"15dk onay geldi ama önündeki karşı bölge çok yakın ({room:.1f}R)."))
+                    continue
+                score = (int(dbias[i] == 1) + int(wbias[i] == 1) + int(fvg)
+                         + int(room is None or room >= 3))
+                ev["grade"] = "A" if score >= 3 else ("B" if score == 2 else "C")
+                ev["score"] = score
+                events.append(ev)
+                armed.append(dict(ev=ev, arm=i))
+                continue
+            left_up = L[i] > q["top"] + 2 * a_i
+            too_long = i - q["start"] > s.get("poi_watch_bars", 48)
+            if left_up or too_long:
+                events.append(dict(kind="POI_NOENTRY", i=i, time=ti, ztop=q["top"], zbot=q["bot"], poi=q["kind"],
+                                   watch_time=q["wt"],
+                                   reason=("tepki aldı ama 15dk'da onay (yapı kırılımı) vermeden uzaklaştı."
+                                           if left_up else "uzun süre bölgede kaldı, 15dk'da onay gelmedi.")))
+                q["inside"] = False
+ 
         # 6) Kurulum hazır: girişe gelmesi bekleniyor
         for a in list(armed):
             ev = a["ev"]
             if a["arm"] == i:
                 continue
             if L[i] <= ev["entry"]:
-                events.append(dict(kind="ENTRY", i=i, time=ti, entry=ev["entry"], stop=ev["stop"],
+                events.append(dict(kind="ENTRY", i=i, time=ti, setup_time=ev["time"], entry=ev["entry"], stop=ev["stop"],
                                    tp1=ev["tp1"], tp2=ev["tp2"], risk=ev["risk"], grade=ev["grade"]))
-                tr = dict(i=i, entry=ev["entry"], stop=ev["stop"], risk=ev["risk"], tp1=ev["tp1"],
+                tr = dict(i=i, setup_time=ev["time"], entry=ev["entry"], stop=ev["stop"], risk=ev["risk"], tp1=ev["tp1"],
                           tp2=ev["tp2"], grade=ev["grade"], setup=ev["setup"], tp1_hit=False, managed=None)
                 trades.append(tr)
                 open_trades.append(tr)
                 armed.remove(a)
             elif H[i] >= ev["tp1"]:
-                events.append(dict(kind="CANCEL", i=i, time=ti, entry=ev["entry"],
+                events.append(dict(kind="CANCEL", i=i, time=ti, setup_time=ev["time"], entry=ev["entry"],
                                    reason="Fiyat girişe gelmeden TP1'e gitti, fırsat kaçtı."))
                 armed.remove(a)
             elif i - a["arm"] > s["arm_bars"]:
-                events.append(dict(kind="CANCEL", i=i, time=ti, entry=ev["entry"],
+                events.append(dict(kind="CANCEL", i=i, time=ti, setup_time=ev["time"], entry=ev["entry"],
                                    reason=f"{s['arm_bars'] * 15 // 60} saat içinde girişe gelmedi."))
                 armed.remove(a)
-
+ 
         # 7) Açık işlemlerin takibi (TP1'de yarısı + stop girişe, TP2'de kalanı)
         for tr in list(open_trades):
             if not tr["tp1_hit"]:
                 if L[i] <= tr["stop"]:
                     tr["managed"] = -1.0
-                    events.append(dict(kind="STOP", i=i, time=ti, entry=tr["entry"], stop=tr["stop"], result=-1.0))
+                    events.append(dict(kind="STOP", i=i, time=ti, setup_time=tr["setup_time"], entry=tr["entry"], stop=tr["stop"], result=-1.0))
                     open_trades.remove(tr)
                     continue
                 if i > tr["i"] and H[i] >= tr["tp1"]:
                     tr["tp1_hit"] = True
-                    events.append(dict(kind="TP1", i=i, time=ti, entry=tr["entry"], tp1=tr["tp1"], tp2=tr["tp2"]))
+                    events.append(dict(kind="TP1", i=i, time=ti, setup_time=tr["setup_time"], entry=tr["entry"], tp1=tr["tp1"], tp2=tr["tp2"]))
                     if H[i] >= tr["tp2"]:
                         tr["managed"] = 2.5
-                        events.append(dict(kind="TP2", i=i, time=ti, tp2=tr["tp2"], result=2.5))
+                        events.append(dict(kind="TP2", i=i, time=ti, setup_time=tr["setup_time"], tp2=tr["tp2"], result=2.5))
                         open_trades.remove(tr)
                         continue
             else:
                 if L[i] <= tr["entry"]:
                     tr["managed"] = 1.0
-                    events.append(dict(kind="BE", i=i, time=ti, entry=tr["entry"], result=1.0))
+                    events.append(dict(kind="BE", i=i, time=ti, setup_time=tr["setup_time"], entry=tr["entry"], result=1.0))
                     open_trades.remove(tr)
                     continue
                 if H[i] >= tr["tp2"]:
                     tr["managed"] = 2.5
-                    events.append(dict(kind="TP2", i=i, time=ti, tp2=tr["tp2"], result=2.5))
+                    events.append(dict(kind="TP2", i=i, time=ti, setup_time=tr["setup_time"], tp2=tr["tp2"], result=2.5))
                     open_trades.remove(tr)
                     continue
             if i - tr["i"] > s["trade_bars"]:
                 open_trades.remove(tr)
-
+ 
     for tr in trades:
         tr["r2"] = _eval_rr(H, L, tr["i"], tr["entry"], tr["stop"], 2.0, s["trade_bars"])
         tr["r3"] = _eval_rr(H, L, tr["i"], tr["entry"], tr["stop"], 3.0, s["trade_bars"])
-
+ 
     # son durumdaki seviyeler (saatlik özet için)
     lv_state = [dict(lvl=lv["lvl"], name=lv["name"], state=lv["state"]) for lv in levels]
+    poi_state = [dict(bot=q["bot"], top=q["top"], kind=q["kind"], inside=q["inside"], touches=q["touches"])
+                 for q in pois]
     return events, trades, dict(own=own, opp=opp, watch=W, open_trades=open_trades,
-                                armed=[a["ev"] for a in armed], levels=lv_state)
-
-
+                                armed=[a["ev"] for a in armed], levels=lv_state, pois=poi_state)
+ 
+ 
 def _flip_event(ev):
     ev = dict(ev)
     for k in PRICE_FIELDS:
@@ -536,12 +718,17 @@ def _flip_event(ev):
     if ev.get("ztop") is not None and ev.get("zbot") is not None:
         ev["ztop"], ev["zbot"] = ev["zbot"], ev["ztop"]
     return ev
-
-
-def run_strategy(df: pd.DataFrame, s: dict, use_kz: bool = True):
+ 
+ 
+def run_strategy(df: pd.DataFrame, s: dict, use_kz: bool = True, d1=None):
     bias = bias_by_bar(df, s)
-    ev_l, tr_l, st_l = run_side(df, s, use_kz, bias)
-    ev_s, tr_s, st_s = run_side(mirror(df), s, use_kz, -bias)
+    if d1 is None or len(d1) < 10:
+        d1 = resample(df, "1D")
+    w1 = weekly_from_daily(d1)
+    dbias = htf_by_bar(d1, DAY, df)
+    wbias = htf_by_bar(w1, WEEK, df)
+    ev_l, tr_l, st_l = run_side(df, s, use_kz, bias, d1, dbias, wbias)
+    ev_s, tr_s, st_s = run_side(mirror(df), s, use_kz, -bias, mirror(d1), -dbias, -wbias)
     for e in ev_l:
         e["dir"] = "L"
     ev_s = [_flip_event(e) for e in ev_s]
@@ -549,10 +736,10 @@ def run_strategy(df: pd.DataFrame, s: dict, use_kz: bool = True):
         e["dir"] = "S"
     events = sorted(ev_l + ev_s, key=lambda e: (e["i"], e["dir"]))
     trades = [dict(tr, dir="L") for tr in tr_l] + [dict(tr, dir="S") for tr in tr_s]
-
+ 
     demand = [(z.bot, z.top, z.tests) for z in st_l["own"]]
     supply = [(z.bot, z.top, z.tests) for z in st_l["opp"]]
-
+ 
     def watch_info(W, flip):
         if W["state"] != 1:
             return None
@@ -560,12 +747,20 @@ def run_strategy(df: pd.DataFrame, s: dict, use_kz: bool = True):
         z = W["zone"]
         zb, zt = (-z.top, -z.bot) if flip else (z.bot, z.top)
         return dict(level=None if np.isnan(lvl) else (-lvl if flip else lvl), zbot=zb, ztop=zt)
-
+ 
     def levels_info(lvls, flip):
         return [dict(lvl=-x["lvl"] if flip else x["lvl"], name=x["name"], state=x["state"]) for x in lvls]
-
+ 
+    def pois_info(ps, flip):
+        return [dict(bot=-x["top"] if flip else x["bot"], top=-x["bot"] if flip else x["top"], kind=x["kind"],
+                     inside=x["inside"], touches=x["touches"]) for x in ps]
+ 
+    _, dnote = structure(d1)
+    _, wnote = structure(w1)
     C = df["close"].values
     snap = dict(
+        dtrend=int(dbias[-1]), wtrend=int(wbias[-1]), dnote=dnote, wnote=wnote,
+        pois_long=pois_info(st_l["pois"], False), pois_short=pois_info(st_s["pois"], True),
         last_time=df.index[-1], last_close=float(C[-1]),
         chg_1h=float(C[-1] / C[-5] - 1) if len(C) > 5 else 0.0,
         bias=int(bias[-1]), in_kz=in_killzone(df.index[-1] + BAR, s), demand=demand, supply=supply,
@@ -575,8 +770,8 @@ def run_strategy(df: pd.DataFrame, s: dict, use_kz: bool = True):
         levels_long=levels_info(st_l["levels"], False), levels_short=levels_info(st_s["levels"], True),
         open_trades=len(st_l["open_trades"]) + len(st_s["open_trades"]))
     return events, trades, snap
-
-
+ 
+ 
 # =====================================================================
 # Grafik resmi (Telegram'a gönderilir)
 # =====================================================================
@@ -587,7 +782,7 @@ def render_chart(name, cfg, df, ev, title):
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     from matplotlib.patches import Rectangle
-
+ 
     d = cfg["digits"]
     i = ev["i"]
     a = max(0, i - 72)
@@ -598,27 +793,31 @@ def render_chart(name, cfg, df, ev, title):
     UP, DN, INK, MUTED = "#1a9e77", "#d6455d", "#1f2430", "#6b7280"
     BLUE, GOLD, PUR = "#3b5bdb", "#f2b705", "#7048e8"
     long = ev["dir"] == "L"
-
+ 
     fig, ax = plt.subplots(figsize=(12, 6.75), dpi=100)
     fig.patch.set_facecolor("white")
     x_ev = i - a
     right = n + 34
     labels = []
-
+ 
     def hline(y, x0, color, style, label, bold=False):
         if y is None or (isinstance(y, float) and np.isnan(y)):
             return
         ax.plot([x0, n - 0.5], [y, y], color=color, lw=1.5, ls=style, zorder=2)
         labels.append([y, y, f"{label} {fmt(y, d)}", color, bold])
-
+ 
     # Bölge kutusu
     if ev.get("ztop") is not None and ev.get("zbot") is not None:
         zcol = UP if long else DN
         ax.add_patch(Rectangle((-0.5, ev["zbot"]), n, ev["ztop"] - ev["zbot"], color=zcol, alpha=0.13, lw=0, zorder=1))
-        ax.text(0.5, ev["ztop"] if long else ev["zbot"], " TALEP BÖLGESİ (1s)" if long else " ARZ BÖLGESİ (1s)",
+        if ev.get("poi"):
+            zlabel = " " + POI_NAMES.get(ev["poi"], "BÖLGE").upper()
+        else:
+            zlabel = " TALEP BÖLGESİ (1s)" if long else " ARZ BÖLGESİ (1s)"
+        ax.text(0.5, ev["ztop"] if long else ev["zbot"], zlabel,
                 color=zcol, fontsize=10, fontweight="bold", va="bottom" if long else "top", zorder=6,
                 bbox=dict(boxstyle="round,pad=0.2", fc="white", ec="none", alpha=0.85))
-
+ 
     # FVG
     if ev["kind"] == "SETUP" and ev.get("fvg") and i >= 2:
         if long:
@@ -626,16 +825,16 @@ def render_chart(name, cfg, df, ev, title):
         else:
             lo, hi = df["high"].values[i], df["low"].values[i - 2]
         ax.add_patch(Rectangle((x_ev - 1.5, lo), n - x_ev + 1, hi - lo, color=GOLD, alpha=0.28, lw=0, zorder=1))
-
+ 
     # Mumlar
     for k in range(n):
         col = UP if C[k] >= O[k] else DN
         ax.plot([k, k], [L[k], H[k]], color=col, lw=1.1, zorder=3)
         ax.add_patch(Rectangle((k - 0.32, min(O[k], C[k])), 0.64, max(abs(C[k] - O[k]), 1e-9), color=col, zorder=4))
-
+ 
     # Olay mumu işareti
     ax.axvline(x_ev, color=MUTED, lw=0.8, ls=":", zorder=1)
-
+ 
     YEL = "#c99a00"
     if ev.get("lvl") is not None:
         nm = ev.get("name", "")
@@ -645,6 +844,8 @@ def render_chart(name, cfg, df, ev, title):
         hline(ev.get("ref_h"), max(0, x_ev - 12), BLUE, "--", "Kırılırsa ALIŞ" if long else "Kırılırsa SATIŞ", bold=True)
         hline(ev.get("ref_l"), max(0, x_ev - 12), PUR, ":", "Likidite")
         hline(ev.get("invalid"), x_ev, DN, "-", "Altında kapanırsa vazgeç" if long else "Üstünde kapanırsa vazgeç")
+    elif ev["kind"] == "POI":
+        hline(ev.get("ref_h"), max(0, x_ev - 12), BLUE, "--", "Kırılırsa ALIŞ" if long else "Kırılırsa SATIŞ", bold=True)
     elif ev["kind"] == "BREAK":
         hline(ev.get("invalid"), x_ev, DN, "-", "Altında kapanırsa vazgeç" if long else "Üstünde kapanırsa vazgeç")
         ax.annotate("Buraya geri gelip dönerse " + ("ALIŞ" if long else "SATIŞ"),
@@ -661,7 +862,7 @@ def render_chart(name, cfg, df, ev, title):
         hline(ev["stop"], x_ev, DN, "-", "STOP", bold=True)
         hline(ev["tp1"], x_ev, UP, "--", "TP1 1:2", bold=True)
         hline(ev["tp2"], x_ev, UP, "-", "TP2 1:3", bold=True)
-
+ 
     # Eksenler
     ys = [L.min(), H.max()]
     for k in ("ztop", "zbot", "lvl", "tp2", "stop", "ref_h", "ref_l", "invalid"):
@@ -699,8 +900,8 @@ def render_chart(name, cfg, df, ev, title):
     fig.savefig(buf, format="png", dpi=100)
     plt.close(fig)
     return buf.getvalue()
-
-
+ 
+ 
 def tg_send_photo(png: bytes, caption: str) -> bool:
     token = os.environ.get("TELEGRAM_TOKEN", "").strip()
     chat = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
@@ -729,38 +930,41 @@ def tg_send_photo(png: bytes, caption: str) -> bool:
             print("Telegram foto hatası:", ex)
             time.sleep(2)
     return False
-
-
+ 
+ 
 def send_chart(name, cfg, df, ev):
     """Grafik gönderimi hiçbir zaman ana mesajı engellemez."""
     if not SEND_CHARTS or df is None:
         return
     try:
         side = "ALIŞ" if ev["dir"] == "L" else "SATIŞ"
-        if ev["kind"] in ("WATCH", "BREAK"):
+        if ev["kind"] == "POI":
+            title = f"{name} | Beklediğim yere geldi ({POI_NAMES.get(ev['poi'], 'bölge')})"
+        elif ev["kind"] in ("WATCH", "BREAK"):
             title = f"{name} | Takipte: {side} fırsatı olabilir"
         else:
-            kind = "kırılım + geri test" if ev.get("setup") == "RETEST" else "bölgeden dönüş"
+            kind = {"RETEST": "kırılım + geri test", "HTF": POI_NAMES.get(ev.get("poi"), "büyük bölge")}.get(
+                ev.get("setup"), "bölgeden dönüş")
             title = f"{name} | {side} FIRSATI ({kind}) — Kalite {ev.get('grade', '')}"
         png = render_chart(name, cfg, df, ev, title)
         tg_send_photo(png, f"<b>{title}</b>")
     except Exception:  # noqa
         traceback.print_exc()
-
-
+ 
+ 
 # =====================================================================
 # Veri
 # =====================================================================
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/126.0 Safari/537.36")
-
-
+ 
+ 
 def _http_json(url: str):
     req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "application/json"})
     with urllib.request.urlopen(req, timeout=25) as r:
         return json.loads(r.read().decode())
-
-
+ 
+ 
 def _yahoo_direct(ticker: str) -> pd.DataFrame:
     """Yahoo grafik API'si (yfinance olmadan, doğrudan)."""
     last = None
@@ -776,16 +980,72 @@ def _yahoo_direct(ticker: str) -> pd.DataFrame:
         except Exception as ex:  # noqa
             last = ex
     raise RuntimeError(f"yahoo: {last}")
-
-
+ 
+ 
+def _yahoo_daily(ticker: str) -> pd.DataFrame:
+    last = None
+    for host in ("query1", "query2"):
+        try:
+            url = (f"https://{host}.finance.yahoo.com/v8/finance/chart/{urllib.parse.quote(ticker)}"
+                   f"?interval=1d&range=2y")
+            js = _http_json(url)
+            res = js["chart"]["result"][0]
+            q = res["indicators"]["quote"][0]
+            idx = pd.to_datetime(res["timestamp"], unit="s", utc=True).normalize()
+            return pd.DataFrame({"open": q["open"], "high": q["high"], "low": q["low"], "close": q["close"]}, index=idx)
+        except Exception as ex:  # noqa
+            last = ex
+    raise RuntimeError(f"yahoo günlük: {last}")
+ 
+ 
+def _coinbase_btc_daily() -> pd.DataFrame:
+    frames = []
+    end = pd.Timestamp.now(tz="UTC").floor("1D")
+    for _ in range(3):
+        start = end - pd.Timedelta(days=300)
+        url = ("https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=86400"
+               f"&start={start.strftime('%Y-%m-%dT%H:%M:%SZ')}&end={end.strftime('%Y-%m-%dT%H:%M:%SZ')}")
+        rows = _http_json(url)
+        if not rows:
+            break
+        d = pd.DataFrame(rows, columns=["t", "low", "high", "open", "close", "vol"])
+        d.index = pd.to_datetime(d["t"], unit="s", utc=True)
+        frames.append(d[["open", "high", "low", "close"]])
+        end = start
+        time.sleep(0.35)
+    if not frames:
+        raise RuntimeError("coinbase günlük: boş")
+    return pd.concat(frames)
+ 
+ 
+def fetch_daily(ticker: str):
+    """Günlük mumlar (son ~2 yıl). Alınamazsa None (15dk veriden üretilir)."""
+    srcs = [("yahoo", lambda: _yahoo_daily(ticker))]
+    if ticker == "BTC-USD":
+        srcs.append(("coinbase", _coinbase_btc_daily))
+    for nm, fn in srcs:
+        try:
+            d = fn().astype(float).dropna()
+            d.index = pd.to_datetime(d.index)
+            d.index = (d.index.tz_localize("UTC") if d.index.tz is None else d.index.tz_convert("UTC")).as_unit("ns")
+            d = d[~d.index.duplicated(keep="last")].sort_index()
+            d = d[d.index + pd.Timedelta("1D") <= pd.Timestamp.now(tz="UTC")]   # bugünün yarım mumu hariç
+            if len(d) >= 30:
+                print(f"  {ticker}: günlük veri = {nm} ({len(d)} gün)")
+                return d
+        except Exception as ex:  # noqa
+            print(f"  {ticker}: günlük {nm} hatası: {ex}")
+    return None
+ 
+ 
 def _yfinance(ticker: str) -> pd.DataFrame:
     import yfinance as yf
     df = yf.Ticker(ticker).history(period="59d", interval="15m", auto_adjust=False)
     if df is None or df.empty:
         raise RuntimeError("yfinance: boş veri")
     return df.rename(columns=str.lower)[["open", "high", "low", "close"]]
-
-
+ 
+ 
 def _coinbase_btc() -> pd.DataFrame:
     """BTC için yedek kaynak: Coinbase 15dk mumlar (300'lük parçalar)."""
     frames = []
@@ -805,8 +1065,8 @@ def _coinbase_btc() -> pd.DataFrame:
     if not frames:
         raise RuntimeError("coinbase: boş veri")
     return pd.concat(frames)
-
-
+ 
+ 
 def _clean(df: pd.DataFrame) -> pd.DataFrame:
     df = df.astype(float).dropna()
     df.index = pd.to_datetime(df.index)
@@ -819,8 +1079,8 @@ def _clean(df: pd.DataFrame) -> pd.DataFrame:
     if len(df) < 300:
         raise RuntimeError(f"çok az mum ({len(df)})")
     return df
-
-
+ 
+ 
 def fetch(ticker: str) -> pd.DataFrame:
     sources = [("yahoo", lambda: _yahoo_direct(ticker)), ("yfinance", lambda: _yfinance(ticker))]
     if ticker == "BTC-USD":
@@ -836,10 +1096,10 @@ def fetch(ticker: str) -> pd.DataFrame:
                 errors.append(f"{name}: {type(ex).__name__}: {str(ex)[:120]}")
         time.sleep(4)
     raise RuntimeError(" | ".join(errors[-3:]))
-
-
-
-
+ 
+ 
+ 
+ 
 # =====================================================================
 # Telegram
 # =====================================================================
@@ -855,8 +1115,8 @@ def _tg_post(token, chat, text):
             print("Telegram hatası:", ex)
             time.sleep(2)
     return False
-
-
+ 
+ 
 def tg_send(text: str) -> bool:
     token = os.environ.get("TELEGRAM_TOKEN", "").strip()
     chat = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
@@ -877,8 +1137,8 @@ def tg_send(text: str) -> bool:
     for c in chunks:
         ok = _tg_post(token, chat, c) and ok
     return ok
-
-
+ 
+ 
 # =====================================================================
 # Mesajlar
 # =====================================================================
@@ -889,12 +1149,12 @@ def W_(d):
                     sweep="altındaki dip", fail="altına", mss_word="üstünde")
     return dict(side="SATIŞ", zone="arz", opp="talep", move="düşüşün", beyond="altında",
                 sweep="üstündeki tepe", fail="üstüne", mss_word="altında")
-
-
+ 
+ 
 def _ok(x):
     return x is not None and not (isinstance(x, float) and np.isnan(x))
-
-
+ 
+ 
 def killzone_tr_text(s=None):
     s = s or SETTINGS
     today = dt.datetime.now(NY).date()
@@ -907,8 +1167,8 @@ def killzone_tr_text(s=None):
         name = kz[2] if len(kz) > 2 else "Seans"
         parts.append(f"{name} {sa:%H:%M}–{sb:%H:%M}")
     return " · ".join(parts) + " (TR)"
-
-
+ 
+ 
 def msg_watch(name, cfg, ev, use_kz):
     d, w = cfg["digits"], W_(ev["dir"])
     lines = [
@@ -936,8 +1196,8 @@ def msg_watch(name, cfg, ev, use_kz):
         lines.append(f"Sadece seans saatlerinde fırsat veririm: {killzone_tr_text()}.")
     lines.append("\nBu henüz işlem değil, sadece haber veriyorum.")
     return "\n".join(lines)
-
-
+ 
+ 
 def approx(x, cfg):
     """Okuması kolay yuvarlanmış fiyat."""
     ax_ = abs(x)
@@ -950,21 +1210,21 @@ def approx(x, cfg):
     else:
         v = f"{round(x / 10) * 10:,.0f}"
     return "~" + v
-
-
+ 
+ 
 def lvl_name(name, d):
     if name == "Dünkü":
         return "dünkü tepe" if d == "L" else "dünkü dip"
     return f"{name} tepesi" if d == "L" else f"{name} dibi"
-
-
+ 
+ 
 def lvl_acc(name, d):
     """'Londra tepesini' / 'dünkü dibi' gibi belirtme hali."""
     if name == "Dünkü":
         return "dünkü tepeyi" if d == "L" else "dünkü dibi"
     return f"{name} tepesini" if d == "L" else f"{name} dibini"
-
-
+ 
+ 
 def msg_break(name, cfg, ev):
     w = W_(ev["dir"])
     up = ev["dir"] == "L"
@@ -983,21 +1243,61 @@ def msg_break(name, cfg, ev):
         "Bu henüz işlem değil, sadece haber veriyorum.",
     ]
     return "\n".join(lines)
-
-
+ 
+ 
 def msg_rfail(name, cfg, ev):
     w = W_(ev["dir"])
     return (f"<b>{name} | {w['side']} fikrinden vazgeçtim</b>\n"
             f"{(lambda x: x[0].upper() + x[1:])(lvl_name(ev['name'], ev['dir']))} ({approx(ev['lvl'], cfg)}): {ev['reason']}")
-
-
+ 
+ 
+def _trend_word(v, d):
+    """v: alış koordinatında 1 = işlemle aynı yön."""
+    if v == 0:
+        return "belirsiz"
+    up = (v == 1) == (d == "L")
+    return "yukarı" if up else "aşağı"
+ 
+ 
+def msg_poi(name, cfg, ev):
+    w = W_(ev["dir"])
+    up = ev["dir"] == "L"
+    pn = POI_NAMES.get(ev["poi"], "önemli bölge")
+    test = f" ({ev['touches']}. test)" if ev["touches"] > 1 else ""
+    lines = [
+        f"<b>{name} | Beklediğim yere geldi</b>",
+        f"Fiyat {pn} bölgesine girdi: {approx(ev['zbot'], cfg)} – {approx(ev['ztop'], cfg)}{test}.",
+        f"Günlük trend: {_trend_word(ev['dtrend'], ev['dir'])} · Haftalık: {_trend_word(ev['wtrend'], ev['dir'])}.",
+        f"Buradan <b>{w['side']}</b> bekliyorum. 15dk'da onay arıyorum: "
+        f"{'son tepe yukarı' if up else 'son dip aşağı'} kırılırsa fırsatı gönderirim.",
+    ]
+    return "\n".join(lines)
+ 
+ 
+def msg_poi_noentry(name, cfg, ev):
+    pn = POI_NAMES.get(ev["poi"], "önemli bölge")
+    return (f"<b>{name} | Beklediğim oldu, giriş yeri çıkmadı</b>\n"
+            f"Fiyat {pn} bölgesine ({approx(ev['zbot'], cfg)} – {approx(ev['ztop'], cfg)}) geldi, "
+            f"{ev['reason']} Tekrar gelirse yine bakarım.")
+ 
+ 
 def msg_setup(name, cfg, ev):
     d, w, u = cfg["digits"], W_(ev["dir"]), cfg.get("unit", "pip")
     up = ev["dir"] == "L"
     dist = ev["risk"] / cfg["pip"]
     bias_word = "yukarı" if up else "aşağı"
     room_txt = "önü açık" if ev["room"] is None else f"karşı bölgeye {ev['room']:.1f}R"
-    if ev.get("setup") == "RETEST":
+    if ev.get("setup") == "HTF":
+        pn = POI_NAMES.get(ev["poi"], "önemli bölge")
+        why = [f"• Günlük trend: {_trend_word(ev['dtrend'], ev['dir'])} · Haftalık: {_trend_word(ev['wtrend'], ev['dir'])}.",
+               f"• Bölge: {pn} {approx(ev['zbot'], cfg)} – {approx(ev['ztop'], cfg)} ({ev['touches']}. test).",
+               f"• Onay: 15dk'da {'son tepe' if up else 'son dip'} ({approx(ev['ref_h'], cfg)}) güçlü mumla kırıldı."]
+        entry_why = "güçlü mumun bıraktığı boşluk (FVG)" if ev["fvg"] else "güçlü mumun ortası"
+        stop_why = f"bölgedeki en {'düşük' if up else 'yüksek'} noktanın {'altı' if up else 'üstü'}"
+        quality = (f"Kalite {ev['grade']} ({ev['score']}/4): günlük {'uyumlu' if ev['dtrend'] == 1 else 'uyumsuz'} · "
+                   f"haftalık {'uyumlu' if ev['wtrend'] == 1 else 'uyumsuz'} · FVG {'var' if ev['fvg'] else 'yok'} · {room_txt}")
+        title = f"<b>{name} | {w['side']} FIRSATI ({pn}) — Kalite {ev['grade']}</b>"
+    elif ev.get("setup") == "RETEST":
         ln = lvl_name(ev["name"], ev["dir"])
         trend_line = (f"• Yön: 4 saatlik trend {bias_word}." if ev.get("trend") == 1 else
                       f"• Yön: 4 saatlik trend net değil ama {'aşağı' if up else 'yukarı'} da değil.")
@@ -1051,82 +1351,109 @@ def msg_setup(name, cfg, ev):
         "Grafikte kontrol et, haber takvimine bak. Karar senin.",
     ]
     return "\n".join(lines)
-
-
+ 
+ 
 def msg_entry(name, cfg, ev):
     d, w = cfg["digits"], W_(ev["dir"])
     return (f"<b>{name} | {w['side']} — GİRİŞ SEVİYESİNE GELDİ</b> (Kalite {ev['grade']})\n"
             f"Limit emrin varsa doldu. Giriş {fmt(ev['entry'], d)} · Stop {fmt(ev['stop'], d)}\n"
             f"TP1 (1:2) {fmt(ev['tp1'], d)} · TP2 (1:3) {fmt(ev['tp2'], d)}")
-
-
+ 
+ 
 def msg_cancel(name, cfg, ev):
     w = W_(ev["dir"])
     return (f"<b>{name} | {w['side']} fırsatından vazgeçtim</b>\n{ev['reason']} "
             f"(giriş {fmt(ev['entry'], cfg['digits'])}). Bekleyen emrin varsa sil.")
-
-
+ 
+ 
 def msg_unwatch(name, cfg, ev):
     d, w = cfg["digits"], W_(ev["dir"])
     return (f"<b>{name} | {w['side']} fikrinden vazgeçtim</b>\n"
             f"Bölge {fmt(ev['zbot'], d)} – {fmt(ev['ztop'], d)}: {ev['reason']}")
-
-
+ 
+ 
 def msg_tp1(name, cfg, ev):
     d, w = cfg["digits"], W_(ev["dir"])
     return (f"<b>{name} | {w['side']} — TP1 geldi (+2R)</b>\n"
             f"Yarısını kapat, stopu girişe ({fmt(ev['entry'], d)}) çek. Kalan hedef TP2 {fmt(ev['tp2'], d)}.")
-
-
+ 
+ 
 def msg_tp2(name, cfg, ev):
     w = W_(ev["dir"])
     return f"<b>{name} | {w['side']} — TP2 geldi</b>\nİşlem tamamlandı: toplam +2,5R (yarısı 2R, yarısı 3R)."
-
-
+ 
+ 
 def msg_be(name, cfg, ev):
     w = W_(ev["dir"])
     return f"<b>{name} | {w['side']} — kalan yarı girişten kapandı</b>\nİşlem tamamlandı: toplam +1R."
-
-
+ 
+ 
 def msg_stop(name, cfg, ev):
     w = W_(ev["dir"])
     return (f"<b>{name} | {w['side']} — stop oldu (−1R)</b>\n"
             f"Kurallara uyduysan bu normal bir kayıp. Sıradaki fırsata.")
-
-
-MESSAGES = {"WATCH": msg_watch, "UNWATCH": msg_unwatch, "BREAK": msg_break, "RFAIL": msg_rfail,
+ 
+ 
+MESSAGES = {"POI": msg_poi, "POI_NOENTRY": msg_poi_noentry, "WATCH": msg_watch, "UNWATCH": msg_unwatch, "BREAK": msg_break, "RFAIL": msg_rfail,
             "SETUP": msg_setup, "ENTRY": msg_entry,
             "CANCEL": msg_cancel, "TP1": msg_tp1, "TP2": msg_tp2, "BE": msg_be, "STOP": msg_stop}
-
-
+ 
+ 
 def symbol_summary(name, cfg, snap):
-    """Kısa: bu paritede şu an ne bekleniyor."""
-    head = f"<b>{name}</b> — "
+    """Kısa: büyük resim + bu paritede şu an ne bekleniyor."""
+    tw = {1: "yukarı", -1: "aşağı", 0: "belirsiz"}
+    dn = f" ({snap['dnote']})" if snap.get("dnote") else ""
+    head = f"<b>{name}</b> — Günlük: {tw[snap['dtrend']]}{dn} · Haftalık: {tw[snap['wtrend']]}"
     if pd.Timestamp.now(tz="UTC") - snap["last_time"] > pd.Timedelta("2h"):
-        return head + "piyasa kapalı."
+        return head + "\n→ piyasa kapalı."
+    px = snap["last_close"]
+ 
+    def say(t):
+        return head + "\n→ " + t
+ 
     for a in snap["armed"]:
         w = W_(a["dir"])
-        return head + f"<b>fırsat açık:</b> {w['side']}, {approx(a['entry'], cfg)} girişine gelmesini bekliyorum."
+        return say(f"<b>fırsat açık:</b> {w['side']}, {approx(a['entry'], cfg)} girişine gelmesini bekliyorum.")
+    for d, ps in (("L", snap.get("pois_long", [])), ("S", snap.get("pois_short", []))):
+        for q in ps:
+            if q["inside"]:
+                w = W_(d)
+                return say(f"<b>beklediğim yerde:</b> fiyat {POI_NAMES.get(q['kind'], 'bölge')} içinde "
+                           f"({approx(q['bot'], cfg)} – {approx(q['top'], cfg)}), 15dk'da {w['side']} onayı bekliyorum.")
     for d, lvls in (("L", snap["levels_long"]), ("S", snap["levels_short"])):
         w = W_(d)
         for lv in lvls:
             if lv["state"] == "retest":
-                return head + (f"<b>beklediğim yerde:</b> {lvl_name(lv['name'], d)} ({approx(lv['lvl'], cfg)}) geri test ediliyor, "
-                               f"{'yukarı' if d == 'L' else 'aşağı'} dönerse {w['side']}.")
+                return say(f"<b>beklediğim yerde:</b> {lvl_name(lv['name'], d)} ({approx(lv['lvl'], cfg)}) geri test ediliyor, "
+                           f"{'yukarı' if d == 'L' else 'aşağı'} dönerse {w['side']}.")
     for d, info in (("L", snap["long"]), ("S", snap["short"])):
         if info:
             w = W_(d)
-            return head + (f"<b>beklediğim yerde:</b> fiyat {w['zone']} bölgesinde ({approx(info['zbot'], cfg)} – "
-                           f"{approx(info['ztop'], cfg)}), {'yukarı' if d == 'L' else 'aşağı'} kırılım gelirse {w['side']}.")
+            return say(f"<b>beklediğim yerde:</b> fiyat {w['zone']} bölgesinde ({approx(info['zbot'], cfg)} – "
+                       f"{approx(info['ztop'], cfg)}), {'yukarı' if d == 'L' else 'aşağı'} kırılım gelirse {w['side']}.")
     for d, lvls in (("L", snap["levels_long"]), ("S", snap["levels_short"])):
         w = W_(d)
         for lv in lvls:
             if lv["state"] == "broken":
-                return head + (f"<b>takipte:</b> {lvl_name(lv['name'], d)} ({approx(lv['lvl'], cfg)}) kırıldı, "
-                               f"geri gelip test etmesini bekliyorum ({w['side']}).")
-    return head + "taktiğimize uygun bir şey yok, bekliyorum."
-
-
+                return say(f"<b>takipte:</b> {lvl_name(lv['name'], d)} ({approx(lv['lvl'], cfg)}) kırıldı, "
+                           f"geri gelip test etmesini bekliyorum ({w['side']}).")
+    # en yakın büyük bölge: oraya gelirse ne bekliyorum
+    cands = []
+    for q in snap.get("pois_long", []):
+        if q["kind"] in ("D1", "W1", "H4") and q["top"] < px:
+            cands.append(((px - q["top"]) / px, q, "L"))
+    for q in snap.get("pois_short", []):
+        if q["kind"] in ("D1", "W1", "H4") and q["bot"] > px:
+            cands.append(((q["bot"] - px) / px, q, "S"))
+    if cands:
+        dist, q, d = min(cands, key=lambda c: c[0])
+        w = W_(d)
+        return say(f"şu an uygun bir şey yok. Beklediğim yer: {POI_NAMES.get(q['kind'], 'bölge')} "
+                   f"{approx(q['bot'], cfg)} – {approx(q['top'], cfg)} ({dist * 100:.1f}% {'aşağıda' if d == 'L' else 'yukarıda'}), "
+                   f"oraya gelirse {w['side']} bakarım.")
+    return say("taktiğimize uygun bir şey yok, bekliyorum.")
+ 
+ 
 # =====================================================================
 # Durum dosyası
 # =====================================================================
@@ -1140,39 +1467,42 @@ def load_state():
     st.setdefault("last_brief", "")
     st.setdefault("errors", {})
     return st
-
-
+ 
+ 
 def save_state(st):
     cutoff = (pd.Timestamp.now(tz="UTC") - pd.Timedelta("3D")).isoformat()
     st["sent"] = {k: v for k, v in st["sent"].items() if v >= cutoff}
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(st, f, ensure_ascii=False, indent=1, sort_keys=True)
-
-
+ 
+ 
 # =====================================================================
 # Ana akış
 # =====================================================================
 def use_kz_for(cfg, s):
     return s["use_killzone"] and cfg.get("use_killzone", True)
-
-
+ 
+ 
 def analyze_all():
     out = {}
     for name, cfg in SYMBOLS.items():
         try:
             df = fetch(cfg["ticker"])
-            events, trades, snap = run_strategy(df, SETTINGS, use_kz_for(cfg, SETTINGS))
-            out[name] = dict(ok=True, df=df, events=events, trades=trades, snap=snap)
+            d1 = fetch_daily(cfg["ticker"])
+            events, trades, snap = run_strategy(df, SETTINGS, use_kz_for(cfg, SETTINGS), d1)
+            out[name] = dict(ok=True, df=df, d1=d1, events=events, trades=trades, snap=snap)
             print(f"{name}: {len(df)} mum, son mum {df.index[-1]}, {len(events)} olay")
         except Exception as ex:  # noqa
             traceback.print_exc()
             out[name] = dict(ok=False, error=str(ex))
     return out
-
-
+ 
+ 
 def _enabled(kind):
-    if kind in ("WATCH", "BREAK"):
+    if kind in ("POI", "POI_NOENTRY"):
         return SEND_WATCH_ALERTS
+    if kind in ("WATCH", "BREAK"):
+        return SEND_SMALL_WATCH_ALERTS
     if kind in ("UNWATCH", "RFAIL"):
         return SEND_GIVEUP_ALERTS
     if kind == "CANCEL":
@@ -1180,8 +1510,8 @@ def _enabled(kind):
     if kind in ("TP1", "TP2", "BE", "STOP"):
         return SEND_RESULT_ALERTS
     return True
-
-
+ 
+ 
 def do_scan(state, results):
     now = pd.Timestamp.now(tz="UTC")
     since = now - pd.Timedelta(hours=ALERT_LOOKBACK_HOURS)
@@ -1197,11 +1527,21 @@ def do_scan(state, results):
         for ev in res["events"]:
             if ev["time"] + BAR < since or not _enabled(ev["kind"]):
                 continue
+            if ev["kind"] == "SETUP" and ev.get("grade", "A") > SEND_MIN_GRADE:
+                continue
+            if ev["kind"] in ("ENTRY", "CANCEL", "TP1", "TP2", "BE", "STOP"):
+                skey = f"{name}|SETUP|{ev['dir']}|{ev['setup_time'].isoformat()}"
+                if skey not in state["sent"]:
+                    continue   # fırsat mesajı gitmediyse takip mesajları da gitmez
             key = f"{name}|{ev['kind']}|{ev['dir']}|{ev['time'].isoformat()}"
             if key in state["sent"]:
                 continue
             if ev["kind"] in ("WATCH", "BREAK") and WATCH_ONLY_IN_KILLZONE and use_kz_for(cfg, SETTINGS) and not ev["kz_now"]:
                 continue
+            if ev["kind"] == "POI_NOENTRY":
+                wkey = f"{name}|POI|{ev['dir']}|{ev['watch_time'].isoformat()}"
+                if wkey not in state["sent"]:
+                    continue
             if ev["kind"] in ("UNWATCH", "RFAIL"):
                 src = "WATCH" if ev["kind"] == "UNWATCH" else "BREAK"
                 wkey = f"{name}|{src}|{ev['dir']}|{ev['watch_time'].isoformat()}"
@@ -1211,38 +1551,38 @@ def do_scan(state, results):
                 text = msg_watch(name, cfg, ev, use_kz_for(cfg, SETTINGS))
             else:
                 text = MESSAGES[ev["kind"]](name, cfg, ev)
-            if ev["kind"] in ("WATCH", "BREAK", "SETUP"):
+            if ev["kind"] in ("WATCH", "BREAK", "POI", "SETUP"):
                 send_chart(name, cfg, res["df"], ev)
             if tg_send(text) or not os.environ.get("TELEGRAM_TOKEN"):
                 state["sent"][key] = now.isoformat()
-
-
+ 
+ 
 def do_brief(results, title="Günlük özet"):
     now = dt.datetime.now(TR).strftime("%d.%m %H:%M")
-    lines = [f"<b>{title}</b> ({now})"]
+    lines = [f"<b>{title}</b> ({now})", ""]
     for name, res in results.items():
         if res["ok"]:
-            lines.append(symbol_summary(name, SYMBOLS[name], res["snap"]))
+            lines.append(symbol_summary(name, SYMBOLS[name], res["snap"]) + "\n")
         else:
             lines.append(f"<b>{name}</b> — veri alınamadı.")
     tg_send("\n".join(lines))
-
-
+ 
+ 
 def _stats(vals):
     v = [x for x in vals if x is not None]
     if not v:
         return "işlem yok"
     w = sum(1 for x in v if x > 0)
     return f"{len(v)} işlem, %{w / len(v) * 100:.0f} kazanç, {sum(v):+.1f}R, işlem başı {np.mean(v):+.2f}R"
-
-
+ 
+ 
 def do_report(results):
     ok = {n: r for n, r in results.items() if r["ok"]}
     if not ok:
         tg_send("<b>Rapor:</b> veri alınamadı.")
         return
     weeks = max(1e-9, np.mean([(r["df"].index[-1] - r["df"].index[0]).days / 7 for r in ok.values()]))
-
+ 
     def line(trades, setups):
         v = [t["managed"] for t in trades if t["managed"] is not None]
         if not v:
@@ -1250,13 +1590,13 @@ def do_report(results):
         w = sum(1 for x in v if x > 0)
         return (f"{setups} fırsat (haftada ~{setups / weeks:.1f}) · {len(v)} işlem · "
                 f"%{w / len(v) * 100:.0f} kazanç · toplam {sum(v):+.1f}R")
-
+ 
     out = [f"<b>Geçmiş test</b> (son ~{weeks:.0f} hafta)"]
     for vname, over in VARIANTS.items():
         s = dict(SETTINGS, **over)
         setups, trades, per = 0, [], []
         for name, r in ok.items():
-            ev, tr = (r["events"], r["trades"]) if not over else run_strategy(r["df"], s, use_kz_for(SYMBOLS[name], s))[:2]
+            ev, tr = (r["events"], r["trades"]) if not over else run_strategy(r["df"], s, use_kz_for(SYMBOLS[name], s), r.get("d1"))[:2]
             n_set = sum(1 for e in ev if e["kind"] == "SETUP")
             setups += n_set
             trades += tr
@@ -1267,16 +1607,16 @@ def do_report(results):
                 out.append(f"   {name}: {line(tr, n_set)}")
     out.append("R = risk ettiğin miktar. +1R = riski kadar kazanç. Az işlemle sonuç kesin değil.")
     tg_send("\n".join(out))
-
-
+ 
+ 
 def main():
     mode = (sys.argv[1] if len(sys.argv) > 1 else os.environ.get("MODE", "scan")).strip().lower() or "scan"
     print("Mod:", mode)
     state = load_state()
     results = analyze_all()
-
+ 
     if mode == "test":
-        tg_send("<b>Fırsat tarayıcı çalışıyor (sürüm 3).</b>\nBu bir test mesajıdır. Aşağıda şu anki durum var.")
+        tg_send("<b>Fırsat tarayıcı çalışıyor (sürüm 5).</b>\nBu bir test mesajıdır. Aşağıda şu anki durum var.")
         do_brief(results, title="Anlık durum")
         # Grafik özelliğini göstermek için geçmişten son kurulum örneği
         last = None
@@ -1299,18 +1639,21 @@ def main():
         now_tr = dt.datetime.now(TR)
         today = now_tr.strftime("%Y-%m-%d")
         hour_key = now_tr.strftime("%Y-%m-%d %H")
+        slot = now_tr.hour - now_tr.hour % STATUS_EVERY_HOURS
+        hour_key = now_tr.strftime("%Y-%m-%d ") + f"{slot:02d}"
         if HOURLY_STATUS and now_tr.hour in HOURLY_HOURS_TR:
             if state.get("last_hourly") != hour_key:
                 first = state["last_brief"] != today
-                do_brief(results, title="Günaydın, günün durumu" if first else "Saatlik durum")
+                do_brief(results, title="Günün ilk durumu" if first else "Durum")
                 state["last_hourly"] = hour_key
                 state["last_brief"] = today
         elif now_tr.hour >= DAILY_BRIEF_TR_HOUR and state["last_brief"] != today:
             do_brief(results)
             state["last_brief"] = today
-
+ 
     save_state(state)
-
-
+ 
+ 
 if __name__ == "__main__":
     main()
+ 
