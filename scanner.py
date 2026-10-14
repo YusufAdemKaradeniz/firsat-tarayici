@@ -87,6 +87,8 @@ VARIANTS = {
                             "killzones": [("02:00", "05:00", "Londra"), ("09:30", "11:00", "NY AM")]},
     "Sadece bölgeden dönüş": {"use_retest": False},
     "Sadece seans saatleri": {"use_killzone": True},
+    "Geniş stop (1,5 ATR tampon)": {"buf_mult": 1.5},
+    "Çok geniş stop (3 ATR tampon)": {"buf_mult": 3.0},
     "Gevşek": {"mss_mult": 0.4, "disp_mult": 0.8, "min_rr": 1.5},
 }
  
@@ -95,6 +97,7 @@ SEND_CHARTS = True            # İZLEMEDE ve KURULUM mesajlarıyla birlikte graf
 WATCH_ONLY_IN_KILLZONE = False # izleme mesajı sadece seans saatlerinde gelsin (gece rahatsız etmez)
 SEND_CANCEL_ALERTS = True     # açık fırsat iptal olunca haber ver (bekleyen emrini silmen için)
 SEND_SMALL_WATCH_ALERTS = False  # 1s bölge / seans tepesi "takipte" mesajları (2 saatlik durum zaten anlatıyor)
+REVIEW_COUNT = 8              # rapor modunda kaç geçmiş işlem grafikle incelensin
 SEND_MIN_GRADE = "B"          # bu kaliteden düşük fırsatlar gönderilmez (A, B ya da C)
 SEND_GIVEUP_ALERTS = False    # "fikrinden vazgeçtim" mesajları (saatlik durum zaten anlatıyor)
 SEND_RESULT_ALERTS = True     # TP1 / TP2 / stop mesajları
@@ -655,7 +658,7 @@ def run_side(df: pd.DataFrame, s: dict, use_kz: bool, bias: np.ndarray, d1=None,
                 events.append(dict(kind="ENTRY", i=i, time=ti, setup_time=ev["time"], entry=ev["entry"], stop=ev["stop"],
                                    tp1=ev["tp1"], tp2=ev["tp2"], risk=ev["risk"], grade=ev["grade"]))
                 tr = dict(i=i, setup_time=ev["time"], entry=ev["entry"], stop=ev["stop"], risk=ev["risk"], tp1=ev["tp1"],
-                          tp2=ev["tp2"], grade=ev["grade"], setup=ev["setup"], tp1_hit=False, managed=None)
+                          tp2=ev["tp2"], grade=ev["grade"], setup=ev["setup"], tp1_hit=False, managed=None, ev=ev)
                 trades.append(tr)
                 open_trades.append(tr)
                 armed.remove(a)
@@ -699,6 +702,19 @@ def run_side(df: pd.DataFrame, s: dict, use_kz: bool, bias: np.ndarray, d1=None,
                 open_trades.remove(tr)
  
     for tr in trades:
+        tr["r1"] = _eval_rr(H, L, tr["i"], tr["entry"], tr["stop"], 1.0, s["trade_bars"])
+        # işlem incelemesi: stoptan önce lehimize en fazla kaç R gitti, stop 1,5 kat olsaydı ne olurdu
+        e0, r0 = tr["entry"], tr["risk"]
+        mfe, end_j = 0.0, None
+        for j in range(tr["i"], min(n, tr["i"] + s["trade_bars"])):
+            if L[j] <= tr["stop"]:
+                end_j = j
+                break
+            if j > tr["i"]:
+                mfe = max(mfe, (H[j] - e0) / r0)
+        tr["mfe"] = mfe
+        tr["end_i"] = end_j
+        tr["wide"] = _eval_rr(H, L, tr["i"], e0, e0 - 1.5 * r0, 2.0 / 1.5, s["trade_bars"])
         tr["r2"] = _eval_rr(H, L, tr["i"], tr["entry"], tr["stop"], 2.0, s["trade_bars"])
         tr["r3"] = _eval_rr(H, L, tr["i"], tr["entry"], tr["stop"], 3.0, s["trade_bars"])
  
@@ -735,7 +751,16 @@ def run_strategy(df: pd.DataFrame, s: dict, use_kz: bool = True, d1=None):
     for e in ev_s:
         e["dir"] = "S"
     events = sorted(ev_l + ev_s, key=lambda e: (e["i"], e["dir"]))
-    trades = [dict(tr, dir="L") for tr in tr_l] + [dict(tr, dir="S") for tr in tr_s]
+    trades = [dict(tr, dir="L") for tr in tr_l]
+    for tr in tr_s:
+        t2 = dict(tr, dir="S")
+        for k in ("entry", "stop", "tp1", "tp2"):
+            t2[k] = -tr[k]
+        t2["ev"] = dict(_flip_event(tr["ev"]), dir="S")
+        trades.append(t2)
+    for t2 in trades:
+        if t2["dir"] == "L":
+            t2["ev"] = dict(t2["ev"], dir="L")
  
     demand = [(z.bot, z.top, z.tests) for z in st_l["own"]]
     supply = [(z.bot, z.top, z.tests) for z in st_l["opp"]]
@@ -775,7 +800,7 @@ def run_strategy(df: pd.DataFrame, s: dict, use_kz: bool = True, d1=None):
 # =====================================================================
 # Grafik resmi (Telegram'a gönderilir)
 # =====================================================================
-def render_chart(name, cfg, df, ev, title):
+def render_chart(name, cfg, df, ev, title, after=25):
     """Olayın olduğu yerin 15dk grafiğini çizer, PNG baytlarını döndürür."""
     import io
     import matplotlib
@@ -786,7 +811,7 @@ def render_chart(name, cfg, df, ev, title):
     d = cfg["digits"]
     i = ev["i"]
     a = max(0, i - 72)
-    b = min(len(df), i + 25)
+    b = min(len(df), i + after)
     sub = df.iloc[a:b]
     n = len(sub)
     O, H, L, C = (sub[c].values for c in ("open", "high", "low", "close"))
@@ -932,7 +957,7 @@ def tg_send_photo(png: bytes, caption: str) -> bool:
     return False
  
  
-def send_chart(name, cfg, df, ev):
+def send_chart(name, cfg, df, ev, after=25, caption=None):
     """Grafik gönderimi hiçbir zaman ana mesajı engellemez."""
     if not SEND_CHARTS or df is None:
         return
@@ -946,7 +971,9 @@ def send_chart(name, cfg, df, ev):
             kind = {"RETEST": "kırılım + geri test", "HTF": POI_NAMES.get(ev.get("poi"), "büyük bölge")}.get(
                 ev.get("setup"), "bölgeden dönüş")
             title = f"{name} | {side} FIRSATI ({kind}) — Kalite {ev.get('grade', '')}"
-        png = render_chart(name, cfg, df, ev, title)
+        if caption:
+            title = caption
+        png = render_chart(name, cfg, df, ev, title, after=after)
         tg_send_photo(png, f"<b>{title}</b>")
     except Exception:  # noqa
         traceback.print_exc()
@@ -1603,10 +1630,98 @@ def do_report(results):
             per.append((name, n_set, tr))
         out.append(f"<b>{vname}:</b> {line(trades, setups)}")
         if not over:
+            sent_tr = [t for t in trades if t.get("grade", "C") <= SEND_MIN_GRADE]
+            out.append(f"   <b>Sana gelenler (kalite {SEND_MIN_GRADE} ve üstü):</b> {line(sent_tr, len(sent_tr))}")
+            def fixed(key, rr):
+                v = [t[key] for t in trades if t.get(key) is not None]
+                if not v:
+                    return "işlem yok"
+                w = sum(1 for x in v if x > 0)
+                return f"%{w / len(v) * 100:.0f} kazanç, toplam {sum(v):+.1f}R"
+            out.append(f"   Sabit hedefle: 1:1 → {fixed('r1', 1)} · 1:2 → {fixed('r2', 2)} · 1:3 → {fixed('r3', 3)}")
+            stops = [t for t in trades if t.get("managed") == -1.0]
+            if stops:
+                wide_ok = sum(1 for t in stops if t.get("wide") is not None and t["wide"] > 0)
+                near = sum(1 for t in stops if t.get("mfe", 0) >= 1.0)
+                out.append(f"   Stop olan {len(stops)} işlemin {near} tanesi önce en az +1R lehimize gitmişti; "
+                           f"stop 1,5 kat geniş olsaydı {wide_ok} tanesi TP1'e ulaşırdı.")
+            out.append("   Kaliteye göre:")
+            for g in ("A", "B", "C"):
+                gt = [t for t in trades if t.get("grade") == g]
+                out.append(f"     {g}: {line(gt, len(gt))}")
+            out.append("   Kurulum türüne göre:")
+            names = {"HTF": "Günlük/haftalık bölge", "ZONE": "1s bölgeden dönüş", "RETEST": "Kırılım + geri test"}
+            for k, nm in names.items():
+                kt = [t for t in trades if t.get("setup") == k]
+                out.append(f"     {nm}: {line(kt, len(kt))}")
+            out.append("   Pariteye göre:")
             for name, n_set, tr in per:
-                out.append(f"   {name}: {line(tr, n_set)}")
+                out.append(f"     {name}: {line(tr, n_set)}")
     out.append("R = risk ettiğin miktar. +1R = riski kadar kazanç. Az işlemle sonuç kesin değil.")
     tg_send("\n".join(out))
+    review_trades(results)
+ 
+ 
+SETUP_NAMES = {"HTF": "günlük/haftalık bölge", "ZONE": "1s bölgeden dönüş", "RETEST": "kırılım + geri test"}
+ 
+ 
+def msg_review(name, cfg, tr):
+    ev = tr["ev"]
+    w = W_(tr["dir"])
+    up = tr["dir"] == "L"
+    d = cfg["digits"]
+    # neden aldı
+    if ev.get("setup") == "HTF":
+        why = (f"{POI_NAMES.get(ev.get('poi'), 'büyük bölge')} ({approx(ev['zbot'], cfg)} – {approx(ev['ztop'], cfg)}) "
+               f"{ev.get('touches', 1)}. kez test edildi, 15dk'da {'son tepe' if up else 'son dip'} kırıldı.")
+    elif ev.get("setup") == "RETEST":
+        why = (f"{lvl_name(ev.get('name', ''), tr['dir'])} ({approx(ev['lvl'], cfg)}) kırıldı, geri test edildi ve "
+               f"{'yukarı' if up else 'aşağı'} döndü.")
+    else:
+        why = (f"1 saatlik {w['zone']} bölgesine ({approx(ev['zbot'], cfg)} – {approx(ev['ztop'], cfg)}) geldi, "
+               f"15dk'da {'son tepe' if up else 'son dip'} kırıldı.")
+    # sonuç
+    m = tr.get("managed")
+    if m is None:
+        res = "Sonuç: işlem hâlâ açık ya da süre doldu."
+    elif m < 0:
+        res = (f"Sonuç: <b>STOP (−1R)</b>. Stoptan önce fiyat en fazla +{tr.get('mfe', 0):.1f}R lehimize gitti. ")
+        if tr.get("mfe", 0) >= 1.0:
+            res += "Önce doğru yöne gitti, sonra geri dönüp stopu aldı. "
+        else:
+            res += "Girişten sonra neredeyse hiç doğru yöne gitmedi; bölge tutmadı. "
+        res += ("Stop 1,5 kat geniş olsaydı TP1'e ulaşırdı." if (tr.get("wide") or 0) > 0
+                else "Stop 1,5 kat geniş olsaydı da stop olurdu.")
+    elif m == 1.0:
+        res = "Sonuç: TP1 geldi (+2R yarısı), kalan yarı girişten kapandı. Toplam <b>+1R</b>."
+    else:
+        res = "Sonuç: TP1 ve TP2 geldi. Toplam <b>+2,5R</b>."
+    return (f"<b>{name} | {w['side']} — {tr_time(ev['time'])} · Kalite {tr.get('grade', '')} · "
+            f"{SETUP_NAMES.get(ev.get('setup'), '')}</b>\n"
+            f"Giriş {fmt(tr['entry'], d)} · Stop {fmt(tr['stop'], d)} · TP1 {fmt(tr['tp1'], d)}\n"
+            f"Neden aldı: {why}\n{res}")
+ 
+ 
+def review_trades(results, count=None):
+    """Geçmişteki son işlemleri grafik + neden + sonuç ile gönderir."""
+    count = count or REVIEW_COUNT
+    allt = []
+    for name, r in results.items():
+        if r.get("ok"):
+            for tr in r["trades"]:
+                if tr.get("grade", "C") <= SEND_MIN_GRADE:
+                    allt.append((r["df"].index[tr["i"]], name, r, tr))
+    allt.sort(key=lambda x: x[0], reverse=True)
+    pick = allt[:count]
+    if not pick:
+        return
+    tg_send(f"<b>Son {len(pick)} işlemin incelemesi</b> (kalite {SEND_MIN_GRADE} ve üstü, en yeniden eskiye)")
+    for _, name, r, tr in pick:
+        cfg = SYMBOLS[name]
+        ev = dict(tr["ev"], entry=tr["entry"], stop=tr["stop"], tp1=tr["tp1"], tp2=tr["tp2"])
+        send_chart(name, cfg, r["df"], ev, after=72,
+                   caption=f"{name} | {'ALIŞ' if tr['dir'] == 'L' else 'SATIŞ'} — {tr_time(tr['ev']['time'])}")
+        tg_send(msg_review(name, cfg, tr))
  
  
 def main():
