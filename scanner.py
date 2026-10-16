@@ -101,6 +101,10 @@ SEND_CHARTS = True            # İZLEMEDE ve KURULUM mesajlarıyla birlikte graf
 WATCH_ONLY_IN_KILLZONE = False # izleme mesajı sadece seans saatlerinde gelsin (gece rahatsız etmez)
 SEND_CANCEL_ALERTS = True     # açık fırsat iptal olunca haber ver (bekleyen emrini silmen için)
 SEND_SMALL_WATCH_ALERTS = False  # 1s bölge / seans tepesi "takipte" mesajları (2 saatlik durum zaten anlatıyor)
+EA_SIGNALS = True             # MT5 robotu (FirsatRobotu) için sinyal yaz — XM demo hesapta otomatik işlem
+VIRTUAL_ACCOUNT = True        # sanal demo hesap: bot her fırsatı kendi hesabında açar/kapatır, bakiyeyi tutar
+ACCOUNT_START = 10000.0       # sanal hesabın başlangıç bakiyesi ($)
+ACCOUNT_RISK_PCT = 1.0        # işlem başına risk (bakiyenin %'si)
 REVIEW_COUNT = 8              # rapor modunda kaç geçmiş işlem grafikle incelensin
 SEND_MIN_GRADE = "B"          # bu kaliteden düşük fırsatlar gönderilmez (A, B ya da C)
 SEND_GIVEUP_ALERTS = False    # "fikrinden vazgeçtim" mesajları (saatlik durum zaten anlatıyor)
@@ -341,13 +345,15 @@ def htf_by_bar(dfx: pd.DataFrame, period: pd.Timedelta, df15: pd.DataFrame) -> n
     return m["v"].fillna(0).astype(int).values
  
  
-def fvg_pois(dfx: pd.DataFrame, period: pd.Timedelta, kind: str):
+def fvg_pois(dfx: pd.DataFrame, period: pd.Timedelta, kind: str, max_frac: float = 1.0):
     """Yükseliş FVG'leri (alış koordinatında destek): [(müsait olduğu an, alt, üst, tür)]"""
     H, L = dfx["high"].values, dfx["low"].values
     a = atr(dfx).values
     out = []
     for k in range(2, len(dfx)):
-        if L[k] > H[k - 2] and not np.isnan(a[k]) and (L[k] - H[k - 2]) >= 0.25 * a[k] and len(dfx) - k <= 120:
+        size = L[k] - H[k - 2]
+        if (L[k] > H[k - 2] and not np.isnan(a[k]) and 0.25 * a[k] <= size <= max_frac * a[k]
+                and len(dfx) - k <= 120):
             out.append((dfx.index[k] + period, float(H[k - 2]), float(L[k]), kind))
     return out
  
@@ -400,8 +406,8 @@ def run_side(df: pd.DataFrame, s: dict, use_kz: bool, bias: np.ndarray, d1=None,
     pev = []
     if s.get("use_htf", True):
         if d1 is not None and len(d1) > 5:
-            pev += fvg_pois(d1, DAY, "D1")
-            pev += fvg_pois(weekly_from_daily(d1), WEEK, "W1")
+            pev += fvg_pois(d1, DAY, "D1", 1.0)                      # çok büyük FVG'ler (bölge değil alan) alınmaz
+            pev += fvg_pois(weekly_from_daily(d1), WEEK, "W1", 0.5)
         pev += cluster_pois(resample(df, "4h"), s.get("h4_touches", 3))
         pev.sort(key=lambda r: r[0])
     pi = 0
@@ -628,6 +634,11 @@ def run_side(df: pd.DataFrame, s: dict, use_kz: bool, bias: np.ndarray, d1=None,
                                        watch_time=q["wt"], reason="bölge kırıldı, fikir bozuldu."))
                 pois.remove(q)
                 continue
+            if q.get("need_exit"):
+                # bir kurulum/vazgeçme sonrası: yeni test sayılması için fiyat önce bölgeden uzaklaşmalı
+                if L[i] > q["top"] + 2 * a_i:
+                    q["need_exit"] = False
+                continue
             if not q["inside"]:
                 if L[i] <= q["top"]:
                     q.update(inside=True, start=i, wt=ti, sweep=L[i], ref_h=last_ph)
@@ -648,6 +659,7 @@ def run_side(df: pd.DataFrame, s: dict, use_kz: bool, bias: np.ndarray, d1=None,
             if not q.get("active", True):
                 if L[i] > q["top"] + 2 * a_i or i - q["start"] > s.get("poi_watch_bars", 48):
                     q["inside"] = False
+                    q["need_exit"] = L[i] <= q["top"] + 2 * a_i
                 continue
             if not np.isnan(ph[i]) and (i - p) >= q["start"]:
                 q["ref_h"] = ph[i]                               # bölgedeki ilk tepkinin tepesi
@@ -659,6 +671,7 @@ def run_side(df: pd.DataFrame, s: dict, use_kz: bool, bias: np.ndarray, d1=None,
                     setup="HTF", poi=q["kind"], ztop=q["top"], zbot=q["bot"], touches=q["touches"],
                     ref_h=q["ref_h"], fvg=fvg, swept=False, dtrend=int(dbias[i]), wtrend=int(wbias[i])))
                 q["inside"] = False
+                q["need_exit"] = True
                 if ev is None:
                     if room is not None:
                         events.append(dict(kind="POI_NOENTRY", i=i, time=ti, ztop=q["top"], zbot=q["bot"],
@@ -680,6 +693,7 @@ def run_side(df: pd.DataFrame, s: dict, use_kz: bool, bias: np.ndarray, d1=None,
                                    reason=("tepki aldı ama 15dk'da onay (yapı kırılımı) vermeden uzaklaştı."
                                            if left_up else "uzun süre bölgede kaldı, 15dk'da onay gelmedi.")))
                 q["inside"] = False
+                q["need_exit"] = not left_up
  
         # 6) Kurulum hazır: girişe gelmesi bekleniyor
         for a in list(armed):
@@ -1632,11 +1646,133 @@ def do_scan(state, results):
                 send_chart(name, cfg, res["df"], ev)
             if tg_send(text) or not os.environ.get("TELEGRAM_TOKEN"):
                 state["sent"][key] = now.isoformat()
+                if ev["kind"] == "SETUP" and EA_SIGNALS:
+                    add_ea_signal(state, name, res, ev)
+                if ev["kind"] == "SETUP" and VIRTUAL_ACCOUNT:
+                    acct_register(state, name, ev)
+    if VIRTUAL_ACCOUNT:
+        lines = acct_sync(state, results)
+        if lines:
+            tg_send("\n".join(lines))
  
  
-def do_brief(results, title="Günlük özet"):
+# =====================================================================
+# Sanal demo hesap (bilgisayar / MT5 gerekmez, her şey GitHub'da)
+# =====================================================================
+DIR_TR = {"L": "alış", "S": "satış"}
+ 
+ 
+def _usd(x):
+    return f"{x:,.0f}$".replace(",", ".")
+ 
+ 
+def _acct(state):
+    a = state.setdefault("acct", {})
+    a.setdefault("start", ACCOUNT_START)
+    a.setdefault("balance", ACCOUNT_START)
+    a.setdefault("since", dt.datetime.now(TR).strftime("%d.%m.%Y"))
+    a.setdefault("trades", [])
+    return a
+ 
+ 
+def acct_register(state, name, ev):
+    a = _acct(state)
+    tid = f"{name}|{ev['dir']}|{ev['time'].isoformat()}"
+    if any(t["id"] == tid for t in a["trades"]):
+        return
+    a["trades"].append(dict(id=tid, sym=name, dir=ev["dir"], setup=ev["time"].isoformat(),
+                            entry=float(ev["entry"]), stop=float(ev["stop"]), status="bekliyor"))
+ 
+ 
+def _close_reason(r):
+    if r <= -0.99:
+        return "stop oldu"
+    if abs(r - 1.0) < 1e-6:
+        return "TP1'de yarısı kapandı, kalanı girişte kapandı"
+    if abs(r - 2.5) < 1e-6:
+        return "TP1 + TP2 hedefi"
+    return f"{SETTINGS['trade_bars'] * 15 // 60} saat doldu, kapatıldı"
+ 
+ 
+def acct_sync(state, results):
+    """Sanal hesaptaki işlemleri tarayıcının kendi takibiyle eşler. Aynı şeyi iki kez saymaz."""
+    a = _acct(state)
+    now = pd.Timestamp.now(tz="UTC")
+    lines = []
+    for t in a["trades"]:
+        if t["status"] not in ("bekliyor", "açık"):
+            continue
+        res = results.get(t["sym"])
+        if not res or not res.get("ok"):
+            continue
+        st = pd.Timestamp(t["setup"])
+        m = next((tr for tr in res["trades"] if tr["dir"] == t["dir"] and tr["setup_time"] == st), None)
+        if m is None:
+            if t["status"] == "bekliyor" and now - st > (SETTINGS["arm_bars"] + 3) * BAR:
+                t["status"] = "iptal"      # girişe gelmedi, hesaba etkisi yok
+            continue
+        d = SYMBOLS[t["sym"]]["digits"]
+        if t["status"] == "bekliyor":
+            t["status"] = "açık"
+            t["risk_usd"] = round(a["balance"] * ACCOUNT_RISK_PCT / 100, 2)
+            t["entry"] = float(m["entry"])
+            t["opened"] = res["df"].index[m["i"]].isoformat()
+            if m.get("managed") is None:
+                lines.append(f"<b>Sanal hesap:</b> {t['sym']} {DIR_TR[t['dir']]} açıldı ({fmt(t['entry'], d)}). "
+                             f"Risk {_usd(t['risk_usd'])} (bakiyenin %{ACCOUNT_RISK_PCT:g}'i).")
+        if m.get("managed") is not None:
+            r = float(m["managed"])
+            pnl = round(t["risk_usd"] * r, 2)
+            a["balance"] = round(a["balance"] + pnl, 2)
+            t.update(status="kapandı", r=r, pnl=pnl, closed=now.isoformat())
+            sign = "+" if pnl >= 0 else "−"
+            lines.append(f"<b>Sanal hesap:</b> {t['sym']} {DIR_TR[t['dir']]} kapandı — {_close_reason(r)}. "
+                         f"{sign}{_usd(abs(pnl))} ({r:+.1f}R). Bakiye: <b>{_usd(a['balance'])}</b>")
+    # eski kayıtları temizle (son 300 kapanmış işlem kalır)
+    keep = [t for t in a["trades"] if t["status"] in ("bekliyor", "açık")]
+    done = [t for t in a["trades"] if t["status"] == "kapandı"][-300:]
+    a["trades"] = done + keep
+    return lines
+ 
+ 
+def acct_summary(state):
+    if not VIRTUAL_ACCOUNT:
+        return ""
+    a = _acct(state)
+    done = [t for t in a["trades"] if t["status"] == "kapandı"]
+    pct = (a["balance"] / a["start"] - 1) * 100
+    w = sum(1 for t in done if t["pnl"] > 0)
+    l = sum(1 for t in done if t["pnl"] < 0)
+    opn = [f"{t['sym']} {DIR_TR[t['dir']]}" for t in a["trades"] if t["status"] == "açık"]
+    txt = (f"<b>Sanal hesap:</b> {_usd(a['balance'])} ({pct:+.1f}%) · başlangıç {a['since']} · "
+           f"{len(done)} işlem: {w} kazanç, {l} kayıp, {len(done) - w - l} başabaş")
+    if opn:
+        txt += " · açık: " + ", ".join(opn)
+    return txt
+ 
+ 
+def add_ea_signal(state, name, res, ev):
+    """MT5 robotunun okuyacağı sinyal listesi (state.json içinde, tek satır metin)."""
+    d = SYMBOLS[name]["digits"]
+    created = int(ev["time"].timestamp()) + 15 * 60                     # mum kapanışı
+    expire = created + SETTINGS["arm_bars"] * 15 * 60                   # girişe gelme süresi
+    sid = f"{name[:3]}{created % 100000000}"
+    ref = float(res["df"]["close"].iloc[-1])
+    sig = dict(id=sid, sym=name, dir=ev["dir"], entry=round(ev["entry"], d), sl=round(ev["stop"], d),
+               tp1=round(ev["tp1"], d), tp2=round(ev["tp2"], d), ref=round(ref, d), exp=expire, t=created)
+    lst = [x for x in state.get("ea", []) if x.get("exp", 0) > time.time() - 86400 and x["id"] != sid]
+    lst.append(sig)
+    state["ea"] = lst[-30:]
+    state["ea_str"] = "|".join(
+        f"{x['id']},{x['sym']},{x['dir']},{x['entry']},{x['sl']},{x['tp1']},{x['tp2']},{x['ref']},{x['exp']}"
+        for x in state["ea"])
+ 
+ 
+def do_brief(results, title="Günlük özet", state=None):
     now = dt.datetime.now(TR).strftime("%d.%m %H:%M")
     lines = [f"<b>{title}</b> ({now})", ""]
+    if state is not None and VIRTUAL_ACCOUNT:
+        lines += [acct_summary(state), ""]
     for name, res in results.items():
         if res["ok"]:
             lines.append(symbol_summary(name, SYMBOLS[name], res["snap"]) + "\n")
@@ -1688,6 +1824,16 @@ def do_report(results):
                     return "işlem yok"
                 w = sum(1 for x in v if x > 0)
                 return f"%{w / len(v) * 100:.0f} kazanç, toplam {sum(v):+.1f}R"
+            sim = sorted(sent_tr, key=lambda t: t["setup_time"])
+            bal, peak, mdd = ACCOUNT_START, ACCOUNT_START, 0.0
+            for t in sim:
+                if t["managed"] is None:
+                    continue
+                bal += bal * ACCOUNT_RISK_PCT / 100 * t["managed"]
+                peak = max(peak, bal)
+                mdd = max(mdd, (peak - bal) / peak * 100)
+            out.append(f"   <b>Sanal hesap olsaydı:</b> {_usd(ACCOUNT_START)} → {_usd(bal)} "
+                       f"({(bal / ACCOUNT_START - 1) * 100:+.1f}%), en büyük düşüş %{mdd:.1f} (işlem başı %{ACCOUNT_RISK_PCT:g} risk)")
             out.append(f"   Sabit hedefle: 1:1 → {fixed('r1', 1)} · 1:2 → {fixed('r2', 2)} · 1:3 → {fixed('r3', 3)}")
             stops = [t for t in trades if t.get("managed") == -1.0]
             if stops:
@@ -1784,8 +1930,8 @@ def main():
     results = analyze_all()
  
     if mode == "test":
-        tg_send("<b>Fırsat tarayıcı çalışıyor (sürüm 5).</b>\nBu bir test mesajıdır. Aşağıda şu anki durum var.")
-        do_brief(results, title="Anlık durum")
+        tg_send("<b>Fırsat tarayıcı çalışıyor (sürüm 9).</b>\nBu bir test mesajıdır. Aşağıda şu anki durum var.")
+        do_brief(results, title="Anlık durum", state=state)
         # Grafik özelliğini göstermek için geçmişten son kurulum örneği
         last = None
         for name, res in results.items():
@@ -1799,7 +1945,7 @@ def main():
             send_chart(name, SYMBOLS[name], res["df"], ev)
             tg_send(msg_setup(name, SYMBOLS[name], ev))
     elif mode == "brief":
-        do_brief(results)
+        do_brief(results, state=state)
     elif mode == "rapor":
         do_report(results)
     else:
@@ -1812,11 +1958,11 @@ def main():
         if HOURLY_STATUS and now_tr.hour in HOURLY_HOURS_TR:
             if state.get("last_hourly") != hour_key:
                 first = state["last_brief"] != today
-                do_brief(results, title="Günün ilk durumu" if first else "Durum")
+                do_brief(results, title="Günün ilk durumu" if first else "Durum", state=state)
                 state["last_hourly"] = hour_key
                 state["last_brief"] = today
         elif now_tr.hour >= DAILY_BRIEF_TR_HOUR and state["last_brief"] != today:
-            do_brief(results)
+            do_brief(results, state=state)
             state["last_brief"] = today
  
     save_state(state)
