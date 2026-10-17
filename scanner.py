@@ -73,6 +73,9 @@ SETTINGS = {
     "max_stop_atr": 8,       # stop bundan uzaksa (ATR cinsinden) daha yakın yapısal seviyeye geç
     "use_htf": True,          # günlük/haftalık FVG ve 4s'te 3+ test edilen seviyelerden fırsat
     "h4_touches": 3,          # 4 saatlikte kaç kez test edilen seviye önemli sayılsın
+    "h1_touches": 3,          # 1 saatlikte kaç kez test edilen seviye önemli sayılsın
+    "use_h1_levels": True,    # 1 saatlikte çok test edilen destek/direnci de giriş bölgesi say
+    "use_barrier": True,      # önünde çok test edilmiş seviye varsa o yöne işlem açma (desteğe satış yok)
     "poi_watch_bars": 48,
     "htf_trend_filter": True, # günlük trend tersse büyük bölgeden işlem arama     # büyük bölgede 15dk onay bekleme (48 = 12 saat)
     "use_retest": True,       # seans tepe/diplerinde kırılım + geri test fırsatları
@@ -86,6 +89,7 @@ SETTINGS = {
 # Rapor modunda karşılaştırılacak ayar setleri
 VARIANTS = {
     "Dengeli (aktif)": {},
+    "Engel filtresi yok (eski)": {"use_barrier": False, "use_h1_levels": False},
     "Katı (eski ayarlar)": {"use_killzone": True, "use_retest": False, "max_tests": 1, "require_sweep": True, "mss_mult": 0.8, "disp_mult": 1.2,
                             "base_mult": 0.5, "piv_len": 3, "watch_bars": 24,
                             "killzones": [("02:00", "05:00", "Londra"), ("09:30", "11:00", "NY AM")]},
@@ -358,30 +362,45 @@ def fvg_pois(dfx: pd.DataFrame, period: pd.Timedelta, kind: str, max_frac: float
     return out
  
  
-def cluster_pois(h4: pd.DataFrame, min_touch: int = 3):
-    """4 saatlikte 3+ kez test edilen dip seviyeleri (alış koordinatında destek)."""
-    H, L = h4["high"].values, h4["low"].values
-    a = atr(h4).values
+def cluster_levels(dfx: pd.DataFrame, period: pd.Timedelta, kind: str, use_high: bool = False,
+                   min_touch: int = 3, tol_mult: float = 0.4):
+    """Çok kez test edilen seviyeler. use_high=False: dipler (destek), True: tepeler (direnç).
+    Seviyeyi iğneyle delip geri dönen salınımlar da test sayılır (haber iğnesi seviyeyi bozmaz).
+    Çıktı: [(müsait olduğu an, alt, üst, tür, test sayısı)]"""
+    H, L = dfx["high"].values, dfx["low"].values
+    a = atr(dfx).values
     ph, pl = pivots(H, L, 2)
+    src = ph if use_high else pl
     clusters, out = [], []
-    for k in range(len(h4)):
-        if np.isnan(pl[k]) or np.isnan(a[k]):
+    for k in range(len(dfx)):
+        if np.isnan(src[k]) or np.isnan(a[k]):
             continue
-        v, tol = pl[k], 0.4 * a[k]
+        v, tol = src[k], tol_mult * a[k]
         for c in clusters:
-            if abs(np.mean(c["v"]) - v) <= tol:
-                c["v"].append(v)
-                c["t"].append(h4.index[k])
-                if len(c["v"]) == min_touch and (c["t"][-1] - c["t"][0]) >= pd.Timedelta("1D"):
-                    out.append((h4.index[k] + H4, float(min(c["v"]) - 0.1 * a[k]),
-                                float(max(c["v"]) + 0.1 * a[k]), "H4"))
+            ref = np.median(c["v"])
+            # iğne: seviyenin ötesine taşan ama ATR x 1.5'tan fazla gitmeyen salınım da test sayılır
+            wick = (v > ref and v - ref <= 1.5 * a[k]) if use_high else (v < ref and ref - v <= 1.5 * a[k])
+            if abs(ref - v) <= tol or wick:
+                if abs(ref - v) <= tol:
+                    c["v"].append(v)
+                c["t"].append(dfx.index[k])
+                if len(c["t"]) == min_touch and (c["t"][-1] - c["t"][0]) >= pd.Timedelta("1D"):
+                    out.append((dfx.index[k] + period, float(min(c["v"]) - 0.1 * a[k]),
+                                float(max(c["v"]) + 0.1 * a[k]), kind, len(c["t"])))
                 break
         else:
-            clusters.append(dict(v=[v], t=[h4.index[k]]))
+            clusters.append(dict(v=[v], t=[dfx.index[k]]))
     return out
  
  
-POI_NAMES = {"D1": "günlük FVG", "W1": "haftalık FVG", "H4": "4 saatlikte 3+ kez test edilen seviye"}
+def cluster_pois(h4: pd.DataFrame, min_touch: int = 3):
+    """4 saatlikte 3+ kez test edilen dip seviyeleri (alış koordinatında destek)."""
+    return [r[:4] for r in cluster_levels(h4, H4, "H4", False, min_touch)]
+ 
+ 
+POI_NAMES = {"D1": "günlük FVG", "W1": "haftalık FVG", "H4": "4 saatlikte 3+ kez test edilen seviye",
+             "H1": "1 saatlikte 3+ kez test edilen seviye"}
+H1 = pd.Timedelta("1h")
  
  
 def run_side(df: pd.DataFrame, s: dict, use_kz: bool, bias: np.ndarray, d1=None, dbias=None, wbias=None):
@@ -409,7 +428,18 @@ def run_side(df: pd.DataFrame, s: dict, use_kz: bool, bias: np.ndarray, d1=None,
             pev += fvg_pois(d1, DAY, "D1", 1.0)                      # çok büyük FVG'ler (bölge değil alan) alınmaz
             pev += fvg_pois(weekly_from_daily(d1), WEEK, "W1", 0.5)
         pev += cluster_pois(resample(df, "4h"), s.get("h4_touches", 3))
+        if s.get("use_h1_levels", True):
+            pev += [r[:4] for r in cluster_levels(resample(df, "1h"), H1, "H1", False, s.get("h1_touches", 3))]
         pev.sort(key=lambda r: r[0])
+    # Engel seviyeler: işlem yönünün önünde çok kez test edilmiş seviye (satışta altta güçlü destek gibi)
+    bev = []
+    if s.get("use_barrier", True):
+        bev += cluster_levels(resample(df, "1h"), H1, "H1", True, s.get("h1_touches", 3))
+        bev += cluster_levels(resample(df, "4h"), H4, "H4", True, s.get("h4_touches", 3))
+        bev.sort(key=lambda r: r[0])
+    bi = 0
+    barriers = []
+    block = {}
     pi = 0
     pois = []
     if dbias is None:
@@ -455,6 +485,13 @@ def run_side(df: pd.DataFrame, s: dict, use_kz: bool, bias: np.ndarray, d1=None,
         r = e - st
         if r <= 0:
             return None, None
+        block.clear()
+        a = A[i] if not np.isnan(A[i]) else 0.0
+        blk = [b for b in barriers if b["top"] >= e - 0.2 * a and b["bot"] < e + s["min_rr"] * r]
+        if blk:
+            b = min(blk, key=lambda x: x["bot"])
+            block.update(n=b["n"], kind=b["kind"])
+            return None, max(0.0, (b["bot"] - e) / r)
         o = nearest_opp(e)
         room = None if o is None else (o - e) / r
         if room is not None and room < s["min_rr"]:
@@ -463,10 +500,28 @@ def run_side(df: pd.DataFrame, s: dict, use_kz: bool, bias: np.ndarray, d1=None,
                   room=room, opp=o, **extra)
         return ev, room
  
+    def no_room_text(room):
+        if block:
+            tf = "1 saatlikte" if block["kind"] == "H1" else "4 saatlikte"
+            return (f"işlem yönünün önünde {tf} {block['n']} kez test edilmiş güçlü bir seviye var. "
+                    f"Oraya doğru işleme girilmez, oradan dönüş beklenir.")
+        return f"önündeki karşı bölge çok yakın ({room:.1f}R). 1:2 kazanç yeri yok, işlem değmez."
+ 
     for i in range(2, n):
         ti = t[i]
         a_i = A[i] if not np.isnan(A[i]) else 0.0
         buf = s["buf_mult"] * a_i
+        # engel seviyeler: yeni gelenler + gerçekten kırılanları sil (2 saat boyunca ötesinde kapanış)
+        while bi < len(bev) and bev[bi][0] <= ti:
+            av, bb, bt, bk, bn = bev[bi]
+            if C[i - 1] <= bt + 0.5 * a_i:
+                barriers.append(dict(bot=bb, top=bt, kind=bk, n=bn, out=0))
+                barriers[:] = barriers[-30:]
+            bi += 1
+        for b in list(barriers):
+            b["out"] = b["out"] + 1 if C[i] > b["top"] + 0.5 * a_i else 0
+            if b["out"] >= 8:
+                barriers.remove(b)
         kz_ok = (not use_kz) or in_killzone(ti, s)
         bias_ok = (not s["use_bias"]) or bias[i] == 1
         not_against = (not s["use_bias"]) or bias[i] != -1
@@ -502,9 +557,12 @@ def run_side(df: pd.DataFrame, s: dict, use_kz: bool, bias: np.ndarray, d1=None,
             if C[i] > z.top:
                 opp.remove(z)
         for z in list(reversed(own)):
-            if C[i] < z.bot:
-                own.remove(z)
+            if C[i] < z.bot - 0.3 * a_i:
+                z.below = getattr(z, "below", 0) + 1
+                if z.below >= 8:          # 2 saat boyunca altında kapandı: bölge gerçekten kırıldı
+                    own.remove(z)
                 continue
+            z.below = 0
             if L[i] <= z.top and L[i - 1] > z.top:
                 z.tests += 1
                 if (W["state"] == 0 and not z.used and z.tests <= s["max_tests"] and bias_ok):
@@ -549,8 +607,7 @@ def run_side(df: pd.DataFrame, s: dict, use_kz: bool, bias: np.ndarray, d1=None,
                         if room is not None:
                             events.append(dict(kind="UNWATCH", i=i, time=ti, ztop=z.top, zbot=z.bot,
                                                watch_time=W["wt"],
-                                               reason=f"Kırılım geldi ama önündeki karşı bölge çok yakın "
-                                                      f"({room:.1f}R). 1:2 kazanç yeri yok, işlem değmez."))
+                                               reason="Kırılım geldi ama " + no_room_text(room)))
                     else:
                         score = int(swept) + int(W["test_no"] == 1) + int(fvg) + int(room is None or room >= 3)
                         ev["grade"] = "A" if score >= 3 else ("B" if score == 2 else "C")
@@ -611,8 +668,7 @@ def run_side(df: pd.DataFrame, s: dict, use_kz: bool, bias: np.ndarray, d1=None,
                     if room is not None and lv.get("announced"):
                         events.append(dict(kind="RFAIL", i=i, time=ti, lvl=lv["lvl"], name=lv["name"],
                                            watch_time=lv["bt"],
-                                           reason=f"Geri testten döndü ama önündeki karşı bölge çok yakın ({room:.1f}R). "
-                                                  f"1:2 kazanç yeri yok."))
+                                           reason="Geri testten döndü ama " + no_room_text(room)))
                     continue
                 score = (int(swept) + int(lv["name"] in ("Londra", "Dünkü", "New York"))
                          + int(bias[i] == 1 or not s["use_bias"]) + int(room is None or room >= 3))
@@ -628,7 +684,8 @@ def run_side(df: pd.DataFrame, s: dict, use_kz: bool, bias: np.ndarray, d1=None,
                 pois.append(dict(bot=bot, top=top, kind=kind, born=av, touches=0, inside=False))
             pi += 1
         for q in list(pois):
-            if C[i] < q["bot"] - max(1.0 * a_i, 0.3 * (q["top"] - q["bot"])):   # bölge kırıldı
+            q["below"] = q.get("below", 0) + 1 if C[i] < q["bot"] - 0.5 * a_i else 0
+            if q["below"] >= 8:   # 2 saat boyunca altında kapandı: bölge gerçekten kırıldı (iğne/haber bozmaz)
                 if q["inside"] and q.get("active", True) and q.get("last_ann") == q.get("wt"):
                     events.append(dict(kind="POI_NOENTRY", i=i, time=ti, ztop=q["top"], zbot=q["bot"], poi=q["kind"],
                                        watch_time=q["wt"], reason="bölge kırıldı, fikir bozuldu."))
@@ -676,9 +733,11 @@ def run_side(df: pd.DataFrame, s: dict, use_kz: bool, bias: np.ndarray, d1=None,
                     if room is not None:
                         events.append(dict(kind="POI_NOENTRY", i=i, time=ti, ztop=q["top"], zbot=q["bot"],
                                            poi=q["kind"], watch_time=q["wt"],
-                                           reason=f"15dk onay geldi ama önündeki karşı bölge çok yakın ({room:.1f}R)."))
+                                           reason="15dk onay geldi ama " + no_room_text(room)))
                     continue
-                score = (int(dbias[i] == 1) + int(wbias[i] == 1) + int(fvg)
+                swept_poi = q["sweep"] < q["bot"]          # altına sarkıp geri alındı (likidite)
+                ev["swept"] = swept_poi
+                score = (int(dbias[i] == 1) + int(wbias[i] == 1) + int(fvg) + int(swept_poi)
                          + int(room is None or room >= 3))
                 ev["grade"] = "A" if score >= 3 else ("B" if score == 2 else "C")
                 ev["score"] = score
@@ -1531,10 +1590,10 @@ def symbol_summary(name, cfg, snap):
     # en yakın büyük bölge: oraya gelirse ne bekliyorum
     cands = []
     for q in snap.get("pois_long", []):
-        if q["kind"] in ("D1", "W1", "H4") and q["top"] < px:
+        if q["kind"] in ("D1", "W1", "H4", "H1") and q["top"] < px:
             cands.append(((px - q["top"]) / px, q, "L"))
     for q in snap.get("pois_short", []):
-        if q["kind"] in ("D1", "W1", "H4") and q["bot"] > px:
+        if q["kind"] in ("D1", "W1", "H4", "H1") and q["bot"] > px:
             cands.append(((q["bot"] - px) / px, q, "S"))
     if cands:
         dist, q, d = min(cands, key=lambda c: c[0])
@@ -1930,7 +1989,7 @@ def main():
     results = analyze_all()
  
     if mode == "test":
-        tg_send("<b>Fırsat tarayıcı çalışıyor (sürüm 9).</b>\nBu bir test mesajıdır. Aşağıda şu anki durum var.")
+        tg_send("<b>Fırsat tarayıcı çalışıyor (sürüm 10).</b>\nBu bir test mesajıdır. Aşağıda şu anki durum var.")
         do_brief(results, title="Anlık durum", state=state)
         # Grafik özelliğini göstermek için geçmişten son kurulum örneği
         last = None
